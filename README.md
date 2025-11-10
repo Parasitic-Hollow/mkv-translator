@@ -87,7 +87,7 @@ python3 translator.py [OPTIONS] INPUT_PATH
 **API Configuration:**
 - `--api-key KEY` - Primary Gemini API key (required if not set as environment variable)
 - `--api-key2 KEY` - Secondary API key for automatic failover when quota is reached
-- `--model NAME` - Gemini model to use (default: `gemini-2.0-flash-exp`)
+- `--model NAME` - Gemini model to use (default: `gemini-2.5-pro`)
 - `--list-models` - List all available Gemini models and exit
 
 **Translation Options:**

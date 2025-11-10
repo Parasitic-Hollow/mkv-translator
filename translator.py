@@ -1349,8 +1349,8 @@ def main():
 
     parser.add_argument("--api-key", help="Primary API key for Google Gemini (or set GEMINI_API_KEY env var).")
     parser.add_argument("--api-key2", help="Secondary API key for additional quota (optional).")
-    parser.add_argument("--model", default="gemini-2.0-flash-exp",
-                       help="The model to use for translation (default: 'gemini-2.0-flash-exp').")
+    parser.add_argument("--model", default="gemini-2.5-pro",
+                       help="The model to use for translation (default: 'gemini-2.5-pro').")
     parser.add_argument("--list-models", action="store_true",
                        help="List available Gemini models and exit.")
     parser.add_argument("--output-dir", type=Path, default=Path("translated_subs"),
