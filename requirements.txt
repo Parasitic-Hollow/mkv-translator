@@ -1,0 +1,3 @@
+google-genai
+pysubs2
+json-repair

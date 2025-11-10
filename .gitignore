@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PIPFILE.lock
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Project specific
+tmp/
+*.progress
+translated_subs/
+*.translated.mkv
+*.es-419.ass
+*.es-419.srt
+*.es-419.ssa
+*.translation.log
+*.thoughts.log
+
+# Test files (if you want to exclude test videos)
+# *.mkv
+
+# Environment variables
+.env
+.env.local
