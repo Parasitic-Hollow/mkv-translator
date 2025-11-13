@@ -28,6 +28,12 @@ except ImportError:
     logging.error("json_repair module not found. Install it with: pip install json-repair")
     sys.exit(1)
 
+try:
+    from audio_utils import prepare_audio
+except ImportError:
+    logging.error("audio_utils module not found. Please ensure audio_utils.py is in the same directory.")
+    sys.exit(1)
+
 # --- API Manager for Dual API Key Support ---
 
 class APIManager:
@@ -116,6 +122,61 @@ logging.getLogger('urllib3').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
 logging.getLogger('httpcore').setLevel(logging.ERROR)
 
+# --- ASS Format Protection ---
+# Use token replacement to guarantee preservation of ASS directives
+# This is more reliable than prompt instructions
+#
+# ASS Text Control Directives:
+# \N - Hard line break (forces new line, not wrappable)
+# \n - Soft line break (wrappable, renderer can adjust)
+# \h - Hard space (non-breaking space)
+ASS_HARD_LINEBREAK = "\\N"
+ASS_SOFT_LINEBREAK = "\\n"
+ASS_HARD_SPACE = "\\h"
+
+ASS_HARD_LINEBREAK_PLACEHOLDER = "<<<ASS_HLB>>>"
+ASS_SOFT_LINEBREAK_PLACEHOLDER = "<<<ASS_SLB>>>"
+ASS_HARD_SPACE_PLACEHOLDER = "<<<ASS_HSP>>>"
+
+
+def protect_ass_directives(text):
+    """
+    Replace ASS format directives with placeholders before translation.
+    This guarantees preservation regardless of model behavior.
+
+    Protects:
+    - \\N (hard line break) → <<<ASS_HLB>>>
+    - \\n (soft line break) → <<<ASS_SLB>>>
+    - \\h (hard space) → <<<ASS_HSP>>>
+
+    More reliable than prompt-based instructions because:
+    - Mechanical preservation (not AI-dependent)
+    - Model never sees the directive (can't misinterpret)
+    - Industry standard approach for i18n systems
+    - Easy to extend for other ASS directives
+    """
+    # Order matters: replace longer sequences first to avoid conflicts
+    text = text.replace(ASS_HARD_LINEBREAK, ASS_HARD_LINEBREAK_PLACEHOLDER)
+    text = text.replace(ASS_SOFT_LINEBREAK, ASS_SOFT_LINEBREAK_PLACEHOLDER)
+    text = text.replace(ASS_HARD_SPACE, ASS_HARD_SPACE_PLACEHOLDER)
+    return text
+
+
+def restore_ass_directives(text):
+    """
+    Restore ASS format directives from placeholders after translation.
+
+    Restores:
+    - <<<ASS_HLB>>> → \\N (hard line break)
+    - <<<ASS_SLB>>> → \\n (soft line break)
+    - <<<ASS_HSP>>> → \\h (hard space)
+    """
+    text = text.replace(ASS_HARD_LINEBREAK_PLACEHOLDER, ASS_HARD_LINEBREAK)
+    text = text.replace(ASS_SOFT_LINEBREAK_PLACEHOLDER, ASS_SOFT_LINEBREAK)
+    text = text.replace(ASS_HARD_SPACE_PLACEHOLDER, ASS_HARD_SPACE)
+    return text
+
+
 # --- ASS Formatting Helper Functions ---
 
 def remove_formatting(text):
@@ -135,6 +196,157 @@ def restore_formatting(original_text, translated_plain_text):
     # Prepend all formatting tags to the translated text
     formatting_prefix = ''.join(formatting_tags)
     return f"{formatting_prefix}{translated_plain_text}"
+
+
+def normalize_ass_colors(ass_path):
+    """
+    Normalize ALL ASS color codes to spec-compliant format in a single pass.
+
+    Industry-standard approach (used by Aegisub, professional subtitle tools):
+    - Proactive normalization BEFORE parsing
+    - Preserves color values where possible
+    - Single-pass efficiency
+    - Never fails - always produces valid ASS
+    - Tolerant of all malformed patterns
+
+    ASS Color Format Spec:
+    - Inline tags: \\c&HBBGGRR& or \\c&HAABBGGRR& (BGR order!)
+    - Style values: &HAABBGGRR& (with alpha channel)
+    - Required: &H prefix and trailing &
+
+    Common malformations fixed:
+    - Missing &H prefix: \\cFFFFFF& → \\c&HFFFFFF&
+    - Missing trailing &: \\c&HFFFFFF → \\c&HFFFFFF&
+    - Double &&: \\c&HFFFFFF&& → \\c&HFFFFFF&
+    - Wrong prefix: \\cH00FFFFFF& → \\c&H00FFFFFF&
+    - Partial hex: \\cFFF& → \\c&H000FFF& (padded to 6 digits)
+    """
+    try:
+        with open(ass_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+
+        original_content = content
+
+        # === Inline Color Tag Normalization ===
+        # Matches: \c, \1c, \2c, \3c, \4c followed by color in any format
+        # Pattern breakdown:
+        # - \\(\d?c) : Matches \c or \1c-\4c
+        # - (?:&H?)?([0-9A-Fa-f]+)&? : Matches color with optional &H and trailing &
+
+        def normalize_inline_color(match):
+            """Normalize a single inline color tag."""
+            tag = match.group(1)  # 'c' or '1c' or '2c' or '3c' or '4c'
+            color_hex = match.group(2)  # Just the hex digits
+
+            # Remove any non-hex characters that slipped through
+            clean_hex = re.sub(r'[^0-9A-Fa-f]', '', color_hex)
+
+            if not clean_hex:
+                # Invalid/empty color - remove the tag entirely
+                return ''
+
+            # Parse hex value
+            try:
+                color_value = int(clean_hex, 16)
+            except ValueError:
+                # Should never happen after cleaning, but be safe
+                return ''
+
+            # Normalize to proper length (pad with zeros if needed)
+            # 6 digits = RGB, 8 digits = ARGB
+            if len(clean_hex) <= 6:
+                # RGB format - pad to 6 digits
+                normalized = f"&H{color_value:06X}&"
+            else:
+                # ARGB format - pad to 8 digits
+                normalized = f"&H{color_value:08X}&"
+
+            return f"\\{tag}{normalized}"
+
+        # Replace all inline color tags
+        # This pattern matches all variations: \c..., \1c..., \2c..., \3c..., \4c...
+        content = re.sub(
+            r'\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])',
+            normalize_inline_color,
+            content,
+            flags=re.IGNORECASE
+        )
+
+        # === Style Line Color Normalization ===
+        # Style lines have colors in specific comma-separated positions
+        # Format: Style: Name,Font,Size,PrimaryColour,SecondaryColour,OutlineColour,BackColour,...
+
+        def normalize_style_line(match):
+            """Normalize colors in a Style: line."""
+            line = match.group(0)
+
+            # Find and normalize each color value in the style
+            # Pattern: color values start with &H or H or just hex digits
+            def fix_style_color(color_match):
+                color_str = color_match.group(0)
+
+                # Extract just hex digits
+                clean_hex = re.sub(r'[^0-9A-Fa-f]', '', color_str)
+
+                if not clean_hex or len(clean_hex) > 8:
+                    # Invalid - use white with full opacity as safe default
+                    return '&H00FFFFFF'
+
+                try:
+                    color_value = int(clean_hex, 16)
+                    # Style colors should be 8 digits (AABBGGRR)
+                    # If shorter, assume RGB and add full opacity (00)
+                    if len(clean_hex) <= 6:
+                        return f"&H00{color_value:06X}"
+                    else:
+                        return f"&H{color_value:08X}"
+                except ValueError:
+                    return '&H00FFFFFF'  # Safe default
+
+            # Match color values in style (anywhere in the line after "Style:")
+            # These are typically &HAABBGGRR or malformed versions
+            # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
+            line = re.sub(
+                r'(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)',
+                fix_style_color,
+                line,
+                flags=re.IGNORECASE
+            )
+
+            return line
+
+        # Normalize all Style: lines
+        content = re.sub(
+            r'^Style:.*$',
+            normalize_style_line,
+            content,
+            flags=re.MULTILINE | re.IGNORECASE
+        )
+
+        # === Cleanup Pass ===
+        # Remove any orphaned/incomplete color tags that might cause issues
+        # These are patterns that look like color tags but are too malformed to fix
+
+        # Remove standalone \c or \Xc without any hex following
+        content = re.sub(r'\\(\d?c)(?![&0-9A-Fa-f])', '', content)
+
+        # Fix any remaining double ampersands
+        content = re.sub(r'&&+', '&', content)
+
+        # === Write if changed ===
+        if content != original_content:
+            with open(ass_path, 'w', encoding='utf-8-sig') as f:
+                f.write(content)
+            logging.debug(f"Normalized ASS color codes in {ass_path.name}")
+            return True
+
+        logging.debug(f"No color normalization needed for {ass_path.name}")
+        return True
+
+    except Exception as e:
+        logging.warning(f"Failed to normalize ASS colors in {ass_path}: {e}")
+        # Don't fail - let pysubs2 handle it
+        return False
 
 # --- MKVToolNix Functions ---
 
@@ -306,7 +518,7 @@ def prompt_resume(saved_line, total_lines):
 
 # --- Translation Helper Functions ---
 
-def get_system_instruction(source_lang, target_lang="Latin American Spanish", thinking=True):
+def get_system_instruction(source_lang, target_lang="Latin American Spanish", thinking=True, audio_file=None):
     """
     Generate system instruction for translation.
     Adapted from gemini-translator-srt's approach with thinking mode support.
@@ -317,18 +529,50 @@ def get_system_instruction(source_lang, target_lang="Latin American Spanish", th
         else "\n\nDo NOT think or reason."
     )
 
-    return f"""You are an assistant that translates subtitles from {source_lang} to {target_lang}.
+    # Field definitions (conditional based on audio_file)
+    fields = (
+        "- index: a string identifier\n"
+        "- content: the text to translate\n"
+        "- time_start: the start time of the segment\n"
+        "- time_end: the end time of the segment\n"
+    ) if audio_file else (
+        "- index: a string identifier\n"
+        "- content: the text to translate\n"
+    )
+
+    instruction = f"""You are an assistant that translates subtitles from {source_lang} to {target_lang}.
 
 You will receive a list of objects, each with these fields:
-- index: a string identifier
-- content: the text to translate
-
+{fields}
 Translate the 'content' field of each object.
 If the 'content' field is empty, leave it as is.
 Preserve line breaks, formatting, and special characters.
 Do NOT move or merge 'content' between objects.
 Do NOT add or remove any objects.
-Do NOT alter the 'index' field.{thinking_instruction}"""
+Do NOT alter the 'index' field."""
+
+    # Audio-specific instructions (conditional)
+    if audio_file:
+        instruction += f"""
+
+You will also receive an audio file.
+Use the time_start and time_end of each object to analyze the audio.
+Analyze the speaker's voice in the audio to determine gender, then apply grammatical gender rules for {target_lang}:
+1. Listen for voice characteristics to identify if speaker is male/female:
+   - Use masculine verb forms/adjectives if speaker sounds male
+   - Use feminine verb forms/adjectives if speaker sounds female
+   - Apply gender agreement to: verbs, adjectives, past participles, pronouns
+   - Example: French 'I am tired' -> 'Je suis fatigué' (male) vs 'Je suis fatiguée' (female)
+2. In some cases you also need to identify who the current speaker is talking to:
+   - If the speaker is talking to a male, use masculine forms.
+   - If the speaker is talking to a female, use feminine forms.
+   - If the speaker is talking to a group, use plural forms.
+   - Example: Portuguese 'You are tired' -> 'Você está cansado' (male) vs 'Você está cansada' (female)
+   - Example: Spanish 'You are talking to a group' -> 'Ustedes están cansados' (male/general group) vs 'Ustedes están cansadas' (female group)"""
+
+    instruction += thinking_instruction
+
+    return instruction
 
 
 def get_translation_config(system_instruction, model_name, thinking=True, thinking_budget=2048):
@@ -526,7 +770,7 @@ def get_last_chunk_size():
 
 
 def process_batch_streaming(client, model_name, batch, previous_message, translated_subtitle, config,
-                           current_line, total_lines, batch_number=1, keep_original=False, original_format=".ass"):
+                           current_line, total_lines, batch_number=1, keep_original=False, original_format=".ass", audio_part=None, audio_file=None):
     """
     Process a batch with streaming responses and real-time progress display.
     Implements retry loop matching gemini-srt-translator's _process_batch pattern.
@@ -544,6 +788,11 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
 
     # Build request
     parts = [types.Part(text=json.dumps(batch, ensure_ascii=False))]
+
+    # Add audio if available (for gender-aware translation)
+    if audio_part:
+        parts.append(audio_part)
+
     current_message = types.Content(role="user", parts=parts)
 
     # Build full conversation
@@ -660,7 +909,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
             if not response_text or not response_text.strip():
                 clear_progress()
                 error_with_progress("Gemini returned an empty response.")
-                info_with_progress("Sending last batch again...", is_sending=True)
+                info_with_progress("Sending last batch again...")
                 continue
 
             # Parse final response
@@ -669,7 +918,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
             except Exception as e:
                 clear_progress()
                 warning_with_progress(f"Failed to parse response: {e}")
-                info_with_progress("Sending last batch again...", is_sending=True)
+                info_with_progress("Sending last batch again...")
                 continue
 
             # Validate response length
@@ -678,7 +927,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                 warning_with_progress(
                     f"Response length mismatch: expected {len(batch)}, got {len(translated_batch)}"
                 )
-                info_with_progress("Sending last batch again...", is_sending=True)
+                info_with_progress("Sending last batch again...")
                 continue
 
             # Final application of translations
@@ -742,7 +991,10 @@ def save_incremental_output(subs, dialogue_events, translated_subtitle, original
     # Restore formatting to translated lines
     for i, event in enumerate(dialogue_events):
         if i < len(translated_subtitle):
-            event.text = restore_formatting(original_texts[i], translated_subtitle[i])
+            # First restore ASS directives from placeholders
+            restored_directives = restore_ass_directives(translated_subtitle[i])
+            # Then restore ASS formatting tags
+            event.text = restore_formatting(original_texts[i], restored_directives)
 
     # Save
     subs.save(str(output_path))
@@ -751,7 +1003,7 @@ def save_incremental_output(subs, dialogue_events, translated_subtitle, original
 
 # --- Core Translation Function ---
 
-def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False):
+def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
     Adapted from gemini-translator-srt's proven architecture.
@@ -780,12 +1032,48 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
     logger.set_log_file_path(str(output_dir / f"{original_mkv_stem}.translation.log"))
     logger.set_thoughts_file_path(str(output_dir / f"{original_mkv_stem}.thoughts.log"))
 
+    # Audio handling for gender-aware translation
+    audio_part = None
+    audio_extracted = False
+
     try:
+        # Extract audio from video if requested
+        if video_path and extract_audio:
+            if video_path.exists():
+                logger.info("Extracting audio from video for gender-aware translation...")
+                audio_file = prepare_audio(str(video_path))
+                if audio_file:
+                    audio_extracted = True
+                else:
+                    logger.warning("Failed to extract audio. Continuing without audio context.")
+            else:
+                logger.error(f"Video file {video_path} does not exist.")
+
+        # Read audio file if provided
+        if audio_file and Path(audio_file).exists():
+            logger.info(f"Loading audio file: {Path(audio_file).name}")
+            with open(audio_file, "rb") as f:
+                audio_bytes = f.read()
+                audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg")
+            logger.info("Audio loaded successfully. Gender-aware translation enabled.")
+        elif audio_file:
+            logger.error(f"Audio file {audio_file} does not exist.")
+
+        # Normalize ASS color codes to spec-compliant format before parsing
+        normalize_ass_colors(ass_path)
+
         # Load and parse subtitle file
-        subs = pysubs2.load(str(ass_path))
+        # Color normalization already applied, so parsing should succeed
+        try:
+            subs = pysubs2.load(str(ass_path))
+        except Exception as e:
+            logger.error(f"Failed to parse ASS file {ass_path.name}: {e}")
+            logger.error("Note: Color normalization was already applied. This may be a different parsing error.")
+            return None, batch_size
+
         if not subs:
             logger.warning(f"No subtitle events found in {ass_path.name}. Skipping.")
-            return None
+            return None, batch_size
 
         # Extract dialogue events (keep your existing logic)
         dialogue_events = []
@@ -797,7 +1085,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         if not all_dialogue_events:
             event_types = set(getattr(line, 'type', 'Unknown') for line in subs)
             logger.warning(f"No Dialogue events found in {ass_path.name}. Found event types: {event_types}")
-            return None
+            return None, batch_size
 
         ass_header_keywords = ["[Script Info]", "[V4+ Styles]", "[Events]", "[Aegisub", "Format:", "Style:",
                                "ScriptType:", "PlayResX:", "PlayResY:", "WrapStyle:", "Title:", "Collisions:"]
@@ -806,13 +1094,15 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             if not any(keyword in event.text for keyword in ass_header_keywords):
                 plain_text = remove_formatting(event.text)
                 if plain_text:
+                    # Protect ASS directives (like \N) before translation
+                    protected_text = protect_ass_directives(plain_text)
                     dialogue_events.append(event)
-                    dialogue_lines.append(plain_text)
+                    dialogue_lines.append(protected_text)
                     original_texts.append(event.text)
 
         if not dialogue_lines:
             logger.warning(f"No valid dialogue lines found in {ass_path.name}.")
-            return None
+            return None, batch_size
 
         total_lines = len(dialogue_lines)
 
@@ -840,10 +1130,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             logger.warning(f"No lines to translate in {ass_path.name} (all lines too short). Skipping.")
             # Just use the original lines - no translation needed
             for i, event in enumerate(dialogue_events):
-                event.text = restore_formatting(original_texts[i], dialogue_lines[i])
+                # Still need to restore ASS directives even for untranslated lines
+                restored_directives = restore_ass_directives(dialogue_lines[i])
+                event.text = restore_formatting(original_texts[i], restored_directives)
             subs.save(str(output_ass_path))
             logger.info(f"Saved (untranslated) output to {output_ass_path}")
-            return output_ass_path
+            return output_ass_path, batch_size
 
         # Check for saved progress
         start_line = 1
@@ -878,8 +1170,8 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                         output_ass_path.unlink()
                     progress_file_path.unlink()
 
-        # Build system instruction
-        system_instruction = get_system_instruction(lang_code, target_lang="Latin American Spanish", thinking=thinking)
+        # Build system instruction (with audio context if available)
+        system_instruction = get_system_instruction(lang_code, target_lang="Latin American Spanish", thinking=thinking, audio_file=audio_file)
 
         # Configure API - get client from manager
         client = api_manager.get_client()
@@ -893,7 +1185,8 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         batch_number = 1  # For thoughts logging
 
         # Skip to start position if resuming
-        while i < total and lines_to_translate[i] < start_line:
+        # Convert start_line (1-indexed) to 0-indexed before comparing
+        while i < total and lines_to_translate[i] < (start_line - 1):
             i += 1
 
         # Build context if resuming
@@ -914,8 +1207,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             last_chunk_size = get_last_chunk_size()
             clear_progress()
             warning_with_progress(
-                f"Translation interrupted. Saving partial results to file. Progress saved.",
-                chunk_size=max(0, last_chunk_size - 1)
+                f"Translation interrupted. Saving partial results to file. Progress saved."
             )
 
             # Save incremental output with current progress
@@ -958,10 +1250,15 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             batch_start_i = i
             while i < total and len(batch) < batch_size:
                 line_idx = lines_to_translate[i]
-                batch.append({
+                batch_item = {
                     "index": str(line_idx),
                     "content": dialogue_lines[line_idx]
-                })
+                }
+                # Add time codes if audio is present (for gender-aware translation)
+                if audio_file:
+                    batch_item["time_start"] = str(dialogue_events[line_idx].start)
+                    batch_item["time_end"] = str(dialogue_events[line_idx].end)
+                batch.append(batch_item)
                 i += 1
 
             # Validate batch size against token limit
@@ -999,7 +1296,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     total_lines=total,
                     batch_number=batch_number,
                     keep_original=keep_original,
-                    original_format=original_format
+                    original_format=original_format,
+                    audio_part=audio_part,
+                    audio_file=audio_file
                 )
                 batch_number += 1  # Increment for next batch
 
@@ -1075,48 +1374,18 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     # Update last quota error timestamp
                     last_time = current_time
                 else:
-                    # For other errors, build context from partial success and resume
-                    i = batch_start_i  # Go back to batch start (consistent with quota error handling)
-                    j = i + last_chunk_size  # End of successful portion
+                    # For other errors, retry the entire batch from the beginning
+                    # This matches gemini-srt-translator's approach: reset and retry full batch
+                    error_with_progress(f"Error: {error_msg}")
+                    info_with_progress("Retrying last batch...")
 
-                    # Build context from successfully translated lines
-                    parts_original = []
-                    parts_translated = []
-                    for k in range(i, max(i, j)):
-                        if k < len(lines_to_translate):
-                            line_idx = lines_to_translate[k]
-                            parts_original.append({
-                                "index": str(line_idx),
-                                "content": dialogue_lines[line_idx]
-                            })
-                            if line_idx < len(translated_subtitle) and translated_subtitle[line_idx]:
-                                parts_translated.append({
-                                    "index": str(line_idx),
-                                    "content": translated_subtitle[line_idx]
-                                })
-
-                    # Update context with partial success
-                    if len(parts_translated) > 0:
-                        previous_message = [
-                            types.Content(
-                                role="user",
-                                parts=[types.Part(text=json.dumps(parts_original, ensure_ascii=False))]
-                            ),
-                            types.Content(
-                                role="model",
-                                parts=[types.Part(text=json.dumps(parts_translated, ensure_ascii=False))]
-                            )
-                        ]
-
+                    # Reset to batch start (this will retry the ENTIRE batch)
+                    i = batch_start_i
                     batch.clear()
 
-                    error_with_progress(f"Error: {error_msg}")
-
-                    if last_chunk_size == 0:
-                        info_with_progress("Sending last batch again...")
-                    else:
-                        i += last_chunk_size
-                        info_with_progress(f"Resuming from line {i}...")
+                    # DO NOT ADVANCE i - we retry the full batch from batch_start_i
+                    # The partial success in translated_subtitle stays, but we re-translate all items
+                    # to ensure consistency
 
                     # Save logs after error
                     logger.save_logs()
@@ -1148,11 +1417,14 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         # Final validation
         if len(translated_subtitle) != len(dialogue_lines):
             logger.error(f"Line count mismatch: {len(translated_subtitle)} vs {len(dialogue_lines)}")
-            return None
+            return None, batch_size
 
         # Restore ASS formatting to final translations
         for i, event in enumerate(dialogue_events):
-            event.text = restore_formatting(original_texts[i], translated_subtitle[i])
+            # First restore ASS directives from placeholders
+            restored_directives = restore_ass_directives(translated_subtitle[i])
+            # Then restore ASS formatting tags
+            event.text = restore_formatting(original_texts[i], restored_directives)
 
         # Save final output
         subs.save(str(output_ass_path))
@@ -1163,10 +1435,15 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             progress_file_path.unlink()
             logging.debug("Progress file deleted (translation complete)")
 
+        # Clean up extracted audio if we extracted it
+        if audio_file and audio_extracted and Path(audio_file).exists():
+            Path(audio_file).unlink()
+            logging.debug(f"Extracted audio file deleted: {Path(audio_file).name}")
+
         # Save logs if enabled
         logger.save_logs()
 
-        return output_ass_path
+        return output_ass_path, batch_size
 
     except KeyboardInterrupt:
         clear_progress()
@@ -1177,7 +1454,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
             logger.info("Progress saved. Run again to resume.")
         logger.save_logs()
-        return None
+        return None, batch_size
 
     except Exception as e:
         clear_progress()
@@ -1187,7 +1464,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             # Save the current dialogue line index
             current_dialogue_line = lines_to_translate[i]
             save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
-        return None
+        return None, batch_size
 
 
 def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
@@ -1234,11 +1511,11 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         return None
 
 
-def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False):
+def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
     extracts, translates, and merges the chosen track.
-    Returns the language code selected by the user, to be remembered for the next file.
+    Returns tuple: (language code, final batch size) to be remembered for subsequent files.
     """
     print(f"\n{'='*60}")
     print(f"Processing: {mkv_path.name}")
@@ -1250,7 +1527,7 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
 
     if expected_output_path.exists():
         logger.info(f"Output file \'{expected_output_name}\' already exists. Skipping.")
-        return None
+        return None, batch_size
 
     tmp_dir = Path("tmp")
     tmp_dir.mkdir(exist_ok=True)
@@ -1266,7 +1543,7 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
 
         if selected_track is None:
             logger.warning(f"No suitable subtitle track found in {mkv_path.name}. Skipping.")
-            return None
+            return None, batch_size
 
         # 3. Check for supported subtitle format and extract the track
         codec_id = selected_track.get("properties", {}).get("codec_id")
@@ -1278,7 +1555,7 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
 
         if codec_id not in supported_codecs:
             logger.warning(f"Unsupported subtitle format \'{codec_id}\' in {mkv_path.name}. Skipping.")
-            return None
+            return None, batch_size
 
         subtitle_track_id = selected_track['id']
         subtitle_extension = supported_codecs[codec_id]
@@ -1294,17 +1571,17 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
             logger.warning(f"MKV file {mkv_path.name} appears to be corrupted. Skipping.")
             if extracted_ass_path.is_file():
                 extracted_ass_path.unlink()
-            return None
+            return None, batch_size
 
         # Check if the file was actually created
         if not extracted_ass_path.is_file() or extracted_ass_path.stat().st_size == 0:
             logger.error(f"Extraction failed for {mkv_path.name}")
-            return None
+            return None, batch_size
 
         logging.debug(f"Successfully extracted subtitle track to {extracted_ass_path}")
 
         # 4. Translate the extracted file (preserving original format)
-        translated_ass_path = translate_ass_file(
+        translated_ass_path, final_batch_size = translate_ass_file(
             extracted_ass_path,
             api_manager,
             model_name,
@@ -1315,14 +1592,17 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
             batch_size,
             thinking,
             thinking_budget,
-            keep_original
+            keep_original,
+            audio_file,
+            extract_audio,
+            mkv_path  # video_path for audio extraction
         )
 
         # 5. Merge the translated subtitle back into a new MKV
         if translated_ass_path:
             merge_subtitles_to_mkv(mkv_path, translated_ass_path, output_dir)
 
-        return lang_code
+        return lang_code, final_batch_size
 
     except FileNotFoundError:
         logger.error("mkvmerge or mkvextract not found. Please ensure MKVToolNix is installed.")
@@ -1333,7 +1613,7 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
     except Exception as e:
         logger.error(f"Unexpected error while processing {mkv_path.name}: {e}")
 
-    return None
+    return None, batch_size
 
 
 # --- Main Execution ---
@@ -1371,6 +1651,10 @@ def main():
                        help="Disable colored output.")
     parser.add_argument("--keep-original", action="store_true",
                        help="Keep original text as hidden comments in ASS subtitles (format: {Original: text}translation).")
+    parser.add_argument("-a", "--audio-file", type=Path, default=None,
+                       help="Audio file for gender-aware translation (MP3 format recommended).")
+    parser.add_argument("--extract-audio", action="store_true",
+                       help="Extract audio from video for gender-aware translation.")
     parser.add_argument("input_path", nargs="?", default=None, type=Path,
                        help="Path to a single .mkv file or directory containing .mkv files.")
 
@@ -1461,21 +1745,29 @@ def main():
         return
 
     remembered_lang = None
+    remembered_batch_size = args.batch_size
     for file_path in files_to_process:
         if file_path.suffix == ".mkv":
-            chosen_lang = process_mkv_file(
+            chosen_lang, final_batch_size = process_mkv_file(
                 file_path,
                 args.output_dir,
                 api_manager,
                 args.model,
                 remembered_lang,
-                args.batch_size,
+                remembered_batch_size,
                 args.thinking,
                 args.thinking_budget,
-                args.keep_original
+                args.keep_original,
+                args.audio_file,
+                args.extract_audio
             )
+            # Remember language selection for subsequent files
             if chosen_lang and not remembered_lang:
                 remembered_lang = chosen_lang
+            # Remember batch size adjustment for subsequent files
+            if final_batch_size and final_batch_size != remembered_batch_size:
+                logger.info(f"Batch size adjusted to {final_batch_size} - will use for remaining files")
+                remembered_batch_size = final_batch_size
 
     logger.success("--- All files processed. ---")
 

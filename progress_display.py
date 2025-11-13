@@ -18,6 +18,9 @@ _loading_bar_index = 0
 _last_progress = None
 _previous_messages = []
 
+# Track if progress bar has been displayed before
+_has_started = False
+
 
 def supports_color():
     """Check if terminal supports color output"""
@@ -71,7 +74,7 @@ def progress_bar(current, total, model_name, chunk_size=0,
         message: Optional message to display below progress bar
         message_color: Color code for message (e.g., "\033[36m" for cyan)
     """
-    global _loading_bar_index, _last_progress, _previous_messages
+    global _loading_bar_index, _last_progress, _previous_messages, _has_started
 
     # Save state for message updates
     _last_progress = {
@@ -122,17 +125,24 @@ def progress_bar(current, total, model_name, chunk_size=0,
         # Wrap entire progress text in blue
         progress_text = f"\033[34m{progress_text}\033[0m"
 
-    # Clear previous output if in TTY
+    # Clear previous output if in TTY (but only after first render)
     if sys.stdout.isatty():
-        # Calculate lines to clear: progress bar + blank line + previous messages
-        lines_to_clear = 2 + len(_previous_messages)
-        if message:  # If adding new message
-            lines_to_clear += 1
+        if _has_started:
+            # Move cursor to beginning of current line first
+            sys.stdout.write("\r")
 
-        # Move up and clear each line
-        for _ in range(lines_to_clear):
-            sys.stdout.write("\033[F")  # Move up
-            sys.stdout.write("\033[K")  # Clear line
+            # Calculate lines to clear: progress bar + blank line + previous messages
+            lines_to_clear = 2 + len(_previous_messages)
+            if message:  # If adding new message
+                lines_to_clear += 1
+
+            # Move up and clear each line
+            for _ in range(lines_to_clear):
+                sys.stdout.write("\033[F")  # Move up
+                sys.stdout.write("\033[K")  # Clear line
+        else:
+            # First time displaying progress bar
+            _has_started = True
 
     # Write progress bar
     sys.stdout.write(progress_text + "\n\n")
@@ -183,17 +193,16 @@ def progress_complete(current, total, model_name):
     """
     Show completion message for translation.
     """
-    global _previous_messages
-
-    # Clear previous messages
-    _previous_messages = []
+    global _previous_messages, _has_started
 
     if supports_color():
         message = f"\033[32m✓ Translation complete ({current}/{total} lines) - {model_name}\033[0m"
     else:
         message = f"✓ Translation complete ({current}/{total} lines) - {model_name}"
 
-    if sys.stdout.isatty():
+    if sys.stdout.isatty() and _has_started:
+        # Move cursor to beginning of current line first
+        sys.stdout.write("\r")
         # Clear the progress bar and messages
         lines_to_clear = 2 + len(_previous_messages)
         for _ in range(lines_to_clear):
@@ -203,12 +212,18 @@ def progress_complete(current, total, model_name):
     print(message)
     sys.stdout.flush()
 
+    # Reset state for next file
+    _previous_messages = []
+    _has_started = False
+
 
 def clear_progress():
     """Clear the current progress line and messages"""
-    global _previous_messages
+    global _previous_messages, _has_started
 
-    if sys.stdout.isatty():
+    if sys.stdout.isatty() and _has_started:
+        # Move cursor to beginning of current line first
+        sys.stdout.write("\r")
         lines_to_clear = 2 + len(_previous_messages)
         for _ in range(lines_to_clear):
             sys.stdout.write("\033[F")
@@ -216,3 +231,15 @@ def clear_progress():
         sys.stdout.flush()
 
     _previous_messages = []
+    _has_started = False
+
+
+def reset_progress_state():
+    """
+    Reset progress bar state between files.
+    Call this when starting translation of a new file in batch processing.
+    """
+    global _previous_messages, _has_started, _last_progress
+    _previous_messages = []
+    _has_started = False
+    _last_progress = None
