@@ -606,6 +606,8 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
     thinking_budget_compatible = "flash" in model_name
 
     # Build thinking config if compatible
+    # Flash models: Use thinking_budget for controlled thinking
+    # Pro models: Enable thinking without budget (handled by timeout/retry mechanism)
     thinking_config = None
     if thinking_compatible and thinking:
         thinking_config = types.ThinkingConfig(
@@ -688,19 +690,24 @@ def is_primarily_latin(text):
 def validate_batch_tokens(client, batch, model_name):
     """
     Validate batch doesn't exceed token limit.
-    From gemini-translator-srt's token validation.
+    Uses actual model limits based on Gemini model specifications.
     """
     try:
+        # Use the ACTUAL model for token counting
         token_count = client.models.count_tokens(
-            model="gemini-2.0-flash",
+            model=model_name,
             contents=json.dumps(batch, ensure_ascii=False)
         )
 
-        # Use a conservative token limit (8192 for most models)
-        # In production, you'd query the model info for actual limits
-        token_limit = 8192
+        # Set token limits based on model (conservative estimates)
+        # Source: https://ai.google.dev/gemini-api/docs/models/gemini
+        if "pro" in model_name:
+            token_limit = 2_000_000  # Pro models: ~2M tokens
+        else:
+            token_limit = 1_000_000  # Flash models: ~1M tokens
 
         if token_count.total_tokens > token_limit * 0.9:
+            # Token limit exceeded - will be shown after clearing progress bar
             logger.error(f"Token count ({token_count.total_tokens}) exceeds 90% of limit ({token_limit})")
             return False
 
@@ -713,15 +720,22 @@ def validate_batch_tokens(client, batch, model_name):
 
 
 def prompt_new_batch_size(current_size):
-    """Prompt user for new batch size when token limit exceeded."""
+    """
+    Prompt user for new batch size when token limit exceeded.
+    Progress bar is cleared before calling this, so use regular output.
+    """
     while True:
         try:
-            new_size = int(input(f"Enter new batch size (current: {current_size}): "))
-            if new_size > 0 and new_size < current_size:
-                return new_size
-            print("Please enter a positive number smaller than current batch size")
+            user_prompt = input(f"Enter new batch size (current: {current_size}): ")
+            if user_prompt.strip():
+                new_size = int(user_prompt)
+                if new_size > 0:
+                    return new_size
+                print("Batch size must be a positive integer.")
+            else:
+                print("Please enter a valid number.")
         except ValueError:
-            print("Please enter a valid number")
+            print("Invalid input. Batch size must be a positive integer.")
         except KeyboardInterrupt:
             logger.warning("\nUser interrupted batch size prompt")
             return current_size // 2  # Default to half
@@ -770,7 +784,8 @@ def get_last_chunk_size():
 
 
 def process_batch_streaming(client, model_name, batch, previous_message, translated_subtitle, config,
-                           current_line, total_lines, batch_number=1, keep_original=False, original_format=".ass", audio_part=None, audio_file=None):
+                           current_line, total_lines, batch_number=1, keep_original=False, original_format=".ass", audio_part=None, audio_file=None,
+                           dialogue_lines=None, unique_text_indices=None):
     """
     Process a batch with streaming responses and real-time progress display.
     Implements retry loop matching gemini-srt-translator's _process_batch pattern.
@@ -807,6 +822,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
     retry = -1
     final_response_text = ""
     final_thoughts_text = ""
+    max_retries_on_timeout = 3  # Retry up to 3 times if thinking times out
 
     # Create lookup dict for original texts (for --keep-original feature)
     original_texts = {int(item["index"]): item["content"] for item in batch}
@@ -819,6 +835,11 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
             chunk_count = 0
             translated_batch = []
             blocked = False
+
+            # Timeout tracking for thinking phase
+            thinking_start_time = None
+            thinking_timeout_seconds = 300  # 5 minutes
+            timed_out = False
 
             # Stream response
             if blocked:
@@ -843,13 +864,31 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                             continue
                         elif part.thought:
                             thoughts_text += part.text
-                            # Show thinking indicator
+
+                            # Track thinking start time
+                            if thinking_start_time is None:
+                                thinking_start_time = time.time()
+
+                            # Check for thinking timeout (5 minutes)
+                            thinking_elapsed = time.time() - thinking_start_time
+                            if thinking_elapsed > thinking_timeout_seconds:
+                                warning_with_progress(
+                                    f"Thinking exceeded {thinking_timeout_seconds//60} minutes. "
+                                    f"Retrying batch (attempt {retry + 1}/{max_retries_on_timeout})..."
+                                )
+                                timed_out = True
+                                break  # Break out of chunk loop
+
+                            # Show thinking indicator with elapsed time
+                            thinking_minutes = int(thinking_elapsed // 60)
+                            thinking_seconds = int(thinking_elapsed % 60)
                             progress_bar(
                                 current=current_line,
                                 total=total_lines,
                                 model_name=model_name,
                                 chunk_size=chunk_count,
-                                is_thinking=True
+                                is_thinking=True,
+                                thinking_time=f"({thinking_minutes}m {thinking_seconds}s)"
                             )
                         else:
                             response_text += part.text
@@ -880,6 +919,14 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
 
                                             translated_subtitle[idx] = content
 
+                                            # Apply translation to all duplicates of this text
+                                            if dialogue_lines is not None and unique_text_indices is not None:
+                                                original_text_content = dialogue_lines[idx].strip()
+                                                if original_text_content in unique_text_indices:
+                                                    for duplicate_idx in unique_text_indices[original_text_content]:
+                                                        if duplicate_idx != idx:  # Skip the one we just translated
+                                                            translated_subtitle[duplicate_idx] = content
+
                                     # Update global chunk size for error recovery
                                     _last_chunk_size = chunk_count
 
@@ -900,6 +947,28 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                                     chunk_size=chunk_count,
                                     is_loading=True
                                 )
+
+                # If timeout occurred during part processing, break chunk loop
+                if timed_out:
+                    break
+
+            # Handle thinking timeout - retry if within limit
+            if timed_out:
+                if retry < max_retries_on_timeout:
+                    clear_progress()
+                    warning_with_progress(f"Thinking timeout. Retrying (attempt {retry + 1}/{max_retries_on_timeout})...")
+                    time.sleep(2)  # Brief pause before retry
+                    continue
+                else:
+                    # Max retries exceeded - give up on this batch
+                    clear_progress()
+                    error_with_progress(
+                        f"Thinking timeout after {max_retries_on_timeout} retries. "
+                        f"Skipping batch {batch_number}. Consider using --no-thinking or a Flash model."
+                    )
+                    # Return empty context to skip this batch
+                    logging.getLogger().setLevel(old_level)
+                    return previous_message
 
             # Check if blocked - exit retry loop
             if blocked:
@@ -946,6 +1015,14 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                         content = f"{{Original: {original_text}}}{content}"
 
                 translated_subtitle[idx] = content
+
+                # Apply translation to all duplicates of this text
+                if dialogue_lines is not None and unique_text_indices is not None:
+                    original_text_content = dialogue_lines[idx].strip()
+                    if original_text_content in unique_text_indices:
+                        for duplicate_idx in unique_text_indices[original_text_content]:
+                            if duplicate_idx != idx:  # Skip the one we just translated
+                                translated_subtitle[duplicate_idx] = content
 
             _last_chunk_size = len(translated_batch)
             final_response_text = response_text
@@ -1003,7 +1080,7 @@ def save_incremental_output(subs, dialogue_events, translated_subtitle, original
 
 # --- Core Translation Function ---
 
-def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None):
+def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None, free_quota=True):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
     Adapted from gemini-translator-srt's proven architecture.
@@ -1031,6 +1108,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
     # Set log file paths
     logger.set_log_file_path(str(output_dir / f"{original_mkv_stem}.translation.log"))
     logger.set_thoughts_file_path(str(output_dir / f"{original_mkv_stem}.thoughts.log"))
+
+    # Import progress display functions
+    from progress_display import clear_progress
 
     # Audio handling for gender-aware translation
     audio_part = None
@@ -1087,10 +1167,38 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             logger.warning(f"No Dialogue events found in {ass_path.name}. Found event types: {event_types}")
             return None, batch_size
 
+        # Styles to exclude from translation (romanized lyrics - already readable)
+        EXCLUDE_STYLES = [
+            r'.*Romaji$',       # Matches: OP-Romaji, ED-Romaji, Insert-Romaji
+            r'.*Romaji[- ]',    # Matches: Romaji-Top, Romaji Bottom
+        ]
+
+        def should_exclude_style(style_name):
+            """Check if style should be excluded from translation (Romaji styles)."""
+            if not style_name:
+                return False
+            for pattern in EXCLUDE_STYLES:
+                if re.match(pattern, style_name, re.IGNORECASE):
+                    return True
+            return False
+
         ass_header_keywords = ["[Script Info]", "[V4+ Styles]", "[Events]", "[Aegisub", "Format:", "Style:",
                                "ScriptType:", "PlayResX:", "PlayResY:", "WrapStyle:", "Title:", "Collisions:"]
 
+        excluded_count = 0
+        vector_drawing_count = 0
         for event in all_dialogue_events:
+            # Skip Romaji styles (romanized lyrics - already readable, don't need translation)
+            if should_exclude_style(event.style):
+                excluded_count += 1
+                continue
+
+            # Skip vector drawings (lines with \p1, \p2, etc. - no text to translate)
+            # These are shapes/animations like Sign - Mask
+            if r'\p1' in event.text or r'\p2' in event.text or r'\p3' in event.text or r'\p4' in event.text:
+                vector_drawing_count += 1
+                continue
+
             if not any(keyword in event.text for keyword in ass_header_keywords):
                 plain_text = remove_formatting(event.text)
                 if plain_text:
@@ -1106,25 +1214,54 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         total_lines = len(dialogue_lines)
 
+        # Deduplicate lines (same text with different effects/layers)
+        # Maps unique text -> list of indices with that text
+        text_to_indices = {}
+        for i, line in enumerate(dialogue_lines):
+            stripped = line.strip()
+            if stripped not in text_to_indices:
+                text_to_indices[stripped] = []
+            text_to_indices[stripped].append(i)
+
+        duplicate_count = total_lines - len(text_to_indices)
+        if duplicate_count > 0:
+            logger.info(f"Found {duplicate_count} duplicate lines (same text with different effects)")
+
         # Filter out lines too short to translate meaningfully
         # Only apply length filter to Latin/ASCII text (CJK can be meaningful in 1-2 chars)
         MIN_TRANSLATION_LENGTH = 2
         lines_to_translate = []  # List of indices that need translation
         translation_map = {}  # Maps index to original text for short lines
+        unique_texts_to_translate = []  # Unique texts that need translation
+        unique_text_indices = {}  # Maps unique text -> first occurrence index
 
-        for i, line in enumerate(dialogue_lines):
-            stripped = line.strip()
+        for unique_text, indices in text_to_indices.items():
+            first_idx = indices[0]  # Use first occurrence as representative
+
             # Only apply MIN_TRANSLATION_LENGTH to Latin scripts
             # CJK, Arabic, Cyrillic, etc. can convey meaning in 1-2 characters
-            if is_primarily_latin(stripped) and len(stripped) < MIN_TRANSLATION_LENGTH:
+            if is_primarily_latin(unique_text) and len(unique_text) < MIN_TRANSLATION_LENGTH:
                 # Keep very short Latin text as-is (e.g., "OK", "Hi", "!")
-                translation_map[i] = line
+                for idx in indices:
+                    translation_map[idx] = dialogue_lines[idx]
             else:
-                # This line needs translation (either non-Latin or long enough)
-                lines_to_translate.append(i)
+                # This text needs translation (either non-Latin or long enough)
+                unique_texts_to_translate.append(unique_text)
+                unique_text_indices[unique_text] = indices
+                lines_to_translate.append(first_idx)  # Track first occurrence for progress
 
-        # Show clean summary
-        print(f"Found {total_lines} dialogue lines ({len(lines_to_translate)} to translate, {len(translation_map)} kept as-is)\n")
+        # Calculate total kept-as-is: Romaji lines + vector drawings + short Latin lines
+        total_kept_as_is = excluded_count + vector_drawing_count + len(translation_map)
+        total_original_lines = len(all_dialogue_events)
+
+        # Show clean summary (total original lines = unique texts to translate + duplicates + kept as-is)
+        unique_count = len(unique_texts_to_translate)
+        print(f"Found {total_original_lines} dialogue lines ({unique_count} unique texts to translate, {total_kept_as_is} kept as-is)\n")
+
+        if duplicate_count > 0:
+            logger.info(f"Deduplication: {duplicate_count} duplicate lines (same text with different effects)")
+        if vector_drawing_count > 0:
+            logger.info(f"Excluded {vector_drawing_count} vector drawing lines (shapes/animations)")
 
         if not lines_to_translate:
             logger.warning(f"No lines to translate in {ass_path.name} (all lines too short). Skipping.")
@@ -1138,16 +1275,17 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             return output_ass_path, batch_size
 
         # Check for saved progress
-        start_line = 1
+        start_line = 0  # ASS dialogue events are 0-indexed
         translated_subtitle = dialogue_lines.copy()  # Start with original text (short lines stay as-is)
 
         if progress_file_path.exists():
             has_progress, saved_line = load_progress(progress_file_path, ass_path)
-            if has_progress and saved_line > 1:
+            if has_progress:
                 # Calculate how many translatable lines have been completed
                 completed_translatable = sum(1 for idx in lines_to_translate if idx < saved_line)
 
-                if prompt_resume(completed_translatable, len(lines_to_translate)):
+                # Only prompt to resume if we've actually translated something
+                if completed_translatable > 0 and prompt_resume(completed_translatable, len(lines_to_translate)):
                     start_line = saved_line
 
                     # Load partial output if it exists
@@ -1156,12 +1294,13 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                             partial_subs = pysubs2.load(str(output_ass_path))
                             partial_events = [e for e in partial_subs if hasattr(e, 'type') and e.type == "Dialogue"]
 
-                            # Extract already translated lines
-                            for i, event in enumerate(partial_events[:start_line - 1]):
+                            # Extract already translated lines (load ALL events, not just [:start_line])
+                            # This matches gemini-srt-translator's approach (line 352)
+                            for i, event in enumerate(partial_events):
                                 if i < len(translated_subtitle):
                                     translated_subtitle[i] = remove_formatting(event.text)
 
-                            logger.info(f"Loaded {start_line - 1} previously translated lines")
+                            logger.info(f"Loaded {completed_translatable} previously translated lines")
                         except Exception as e:
                             logger.warning(f"Failed to load partial output: {e}")
                 else:
@@ -1185,12 +1324,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         batch_number = 1  # For thoughts logging
 
         # Skip to start position if resuming
-        # Convert start_line (1-indexed) to 0-indexed before comparing
-        while i < total and lines_to_translate[i] < (start_line - 1):
+        # Skip until we find the dialogue line index that matches start_line
+        while i < total and lines_to_translate[i] < start_line:
             i += 1
 
         # Build context if resuming
-        if start_line > 1:
+        if start_line > 0:
             previous_message = build_resume_context(
                 dialogue_lines,
                 translated_subtitle,
@@ -1233,12 +1372,31 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         signal.signal(signal.SIGINT, handle_interrupt)
 
-        # Show dual API status if enabled (matching gemini-srt-translator line 465-466)
-        if api_manager.has_secondary_key():
-            info_with_progress(f"Starting with API Key {api_manager.current_api_number}")
-
         # Track quota error timing for smart API switching (gemini-srt-translator line 487)
         last_time = 0
+
+        # Rate limiting for free tier users with pro models (gemini-srt-translator lines 395-404)
+        delay = False
+        delay_time = 30
+
+        if "pro" in model_name:
+            if free_quota:
+                delay = True
+                if not api_manager.has_secondary_key():
+                    logger.info("Pro model and free user quota detected.\n")
+                else:
+                    delay_time = 15
+                    logger.info("Pro model and free user quota detected, using secondary API key if needed.\n")
+            else:
+                logger.info("Paid quota mode enabled - no artificial rate limiting.\n")
+
+        # Show initial progress bar (matching gemini-srt-translator line 460)
+        progress_bar(
+            current=i,
+            total=total,
+            model_name=model_name,
+            is_sending=True
+        )
 
         # Main translation loop (like gemini-translator-srt lines 489-606)
         batch = []  # Initialize batch outside loop for signal handler access
@@ -1264,6 +1422,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             # Validate batch size against token limit
             while not validated:
                 if not validate_batch_tokens(client, batch, model_name):
+                    # Clear progress bar for cleaner token validation display
+                    clear_progress()
+
                     # Reduce batch size and retry
                     new_batch_size = prompt_new_batch_size(batch_size)
                     decrement = batch_size - new_batch_size
@@ -1272,8 +1433,11 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                             i -= 1
                             batch.pop()
                     batch_size = new_batch_size
-                else:
-                    validated = True
+
+                    # Continue silently - user already confirmed in prompt
+                    continue
+                # Token validation passed, continue silently
+                validated = True
 
             # Translate batch with partial success tracking
             try:
@@ -1284,6 +1448,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     model_name=model_name,
                     is_sending=True
                 )
+
+                # Track batch processing time for rate limiting (gemini-srt-translator line 537)
+                start_time = time.time()
 
                 previous_message = process_batch_streaming(
                     client=client,
@@ -1298,12 +1465,18 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     keep_original=keep_original,
                     original_format=original_format,
                     audio_part=audio_part,
-                    audio_file=audio_file
+                    audio_file=audio_file,
+                    dialogue_lines=dialogue_lines,
+                    unique_text_indices=unique_text_indices
                 )
                 batch_number += 1  # Increment for next batch
 
                 # Save progress after successful batch
-                current_dialogue_line = lines_to_translate[i - 1] + 1 if i > 0 else 0
+                # Save index of next dialogue line to process (not position in lines_to_translate)
+                if i < total:
+                    current_dialogue_line = lines_to_translate[i]
+                else:
+                    current_dialogue_line = total_lines
                 save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
 
                 # Save logs incrementally after each batch
@@ -1319,6 +1492,11 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 )
 
                 batch.clear()
+
+                # Apply rate limiting delay for free tier users (gemini-srt-translator lines 547-548)
+                end_time = time.time()
+                if delay and (end_time - start_time < delay_time) and i < total:
+                    time.sleep(delay_time - (end_time - start_time))
 
             except Exception as e:
                 error_msg = str(e)
@@ -1338,8 +1516,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                         # Successfully switched to alternative API
                         info_with_progress(
                             f"API {api_manager.backup_api_number} quota exceeded! "
-                            f"Switching to API {api_manager.current_api_number}...",
-                            is_sending=True
+                            f"Switching to API {api_manager.current_api_number}..."
                         )
 
                         # Create new client with switched API key
@@ -1368,7 +1545,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
                         # Countdown wait
                         for j in range(60, 0, -1):
-                            progress_bar(batch_start_i, total_lines, model_name, is_retrying=True, retry_countdown=j)
+                            progress_bar(batch_start_i, total, model_name, is_retrying=True, retry_countdown=j)
                             time.sleep(1)
 
                     # Update last quota error timestamp
@@ -1511,11 +1688,15 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         return None
 
 
-def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False):
+def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, free_quota=True):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
     extracts, translates, and merges the chosen track.
     Returns tuple: (language code, final batch size) to be remembered for subsequent files.
+
+    Args:
+        free_quota: If True (default), apply rate limiting for free tier users.
+                   If False (--paid-quota), remove artificial delays for paid users.
     """
     print(f"\n{'='*60}")
     print(f"Processing: {mkv_path.name}")
@@ -1595,7 +1776,8 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
             keep_original,
             audio_file,
             extract_audio,
-            mkv_path  # video_path for audio extraction
+            mkv_path,  # video_path for audio extraction
+            free_quota
         )
 
         # 5. Merge the translated subtitle back into a new MKV
@@ -1630,7 +1812,8 @@ def main():
     parser.add_argument("--api-key", help="Primary API key for Google Gemini (or set GEMINI_API_KEY env var).")
     parser.add_argument("--api-key2", help="Secondary API key for additional quota (optional).")
     parser.add_argument("--model", default="gemini-2.5-pro",
-                       help="The model to use for translation (default: 'gemini-2.5-pro').")
+                       help="The model to use for translation (default: 'gemini-2.5-pro'). "
+                            "Note: Pro models may take longer for thinking, but have automatic timeout/retry.")
     parser.add_argument("--list-models", action="store_true",
                        help="List available Gemini models and exit.")
     parser.add_argument("--output-dir", type=Path, default=Path("translated_subs"),
@@ -1655,6 +1838,8 @@ def main():
                        help="Audio file for gender-aware translation (MP3 format recommended).")
     parser.add_argument("--extract-audio", action="store_true",
                        help="Extract audio from video for gender-aware translation.")
+    parser.add_argument("--paid-quota", action="store_true",
+                       help="Remove artificial rate limits for paid quota users (allows faster processing).")
     parser.add_argument("input_path", nargs="?", default=None, type=Path,
                        help="Path to a single .mkv file or directory containing .mkv files.")
 
@@ -1668,6 +1853,14 @@ def main():
     if args.thinking_budget < 0 or args.thinking_budget > 24576:
         logger.error("thinking-budget must be between 0 and 24576")
         sys.exit(1)
+
+    # Info message for Pro models with thinking
+    if args.thinking and "pro" in args.model.lower() and "flash" not in args.model.lower():
+        logger.info(
+            f"Using {args.model} with thinking mode enabled.\n"
+            f"Pro models may take longer to think (5+ minutes per batch is normal).\n"
+            f"Automatic timeout/retry enabled - will retry if thinking exceeds 5 minutes."
+        )
 
     # Initialize enhanced logger settings
     logger.set_color_mode(not args.no_colors)
@@ -1748,6 +1941,9 @@ def main():
     remembered_batch_size = args.batch_size
     for file_path in files_to_process:
         if file_path.suffix == ".mkv":
+            # Set free_quota based on paid_quota flag (inverted logic)
+            free_quota = not args.paid_quota
+
             chosen_lang, final_batch_size = process_mkv_file(
                 file_path,
                 args.output_dir,
@@ -1759,7 +1955,8 @@ def main():
                 args.thinking_budget,
                 args.keep_original,
                 args.audio_file,
-                args.extract_audio
+                args.extract_audio,
+                free_quota
             )
             # Remember language selection for subsequent files
             if chosen_lang and not remembered_lang:

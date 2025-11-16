@@ -240,12 +240,15 @@ def prepare_audio(video_path):
     2. Extract audio from video (mono conversion)
     3. Compress to target size (~20MB MP3)
 
-    Returns path to prepared audio file.
+    Returns path to prepared audio file in tmp/ directory.
     """
-    output_dir = os.path.dirname(video_path)
+    # Use project tmp directory (matches gemini-translator pattern)
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
+
     base_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_path = os.path.join(output_dir, f"{base_name}_extracted.wav")
-    final_path = os.path.join(output_dir, f"{base_name}_audio.mp3")
+    output_path = str(tmp_dir / f"{base_name}_extracted.wav")
+    final_path = str(tmp_dir / f"{base_name}_audio.mp3")
 
     # Skip if already extracted
     if os.path.exists(final_path):

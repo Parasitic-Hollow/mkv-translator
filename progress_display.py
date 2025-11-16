@@ -56,7 +56,7 @@ def clear_lines(num_lines):
 def progress_bar(current, total, model_name, chunk_size=0,
                  is_loading=False, is_sending=False, is_thinking=False,
                  is_retrying=False, retry_countdown=0, bar_length=30,
-                 message="", message_color=None):
+                 thinking_time="", message="", message_color=None):
     """
     Display animated progress bar with real-time updates and optional message below.
 
@@ -71,6 +71,7 @@ def progress_bar(current, total, model_name, chunk_size=0,
         is_retrying: Show retry countdown
         retry_countdown: Seconds remaining for retry
         bar_length: Length of progress bar in characters
+        thinking_time: Elapsed thinking time string (e.g., "2m 34s") - shown in status line
         message: Optional message to display below progress bar
         message_color: Color code for message (e.g., "\033[36m" for cyan)
     """
@@ -100,6 +101,8 @@ def progress_bar(current, total, model_name, chunk_size=0,
         status = "| Sending batch ↑↑↑"
     elif is_thinking:
         status = f"| Thinking {_LOADING_BARS[_loading_bar_index]}"
+        if thinking_time:
+            status += f" {thinking_time}"
         _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
     elif is_loading:
         status = f"| Processing {_LOADING_BARS[_loading_bar_index]}"
