@@ -575,10 +575,19 @@ Analyze the speaker's voice in the audio to determine gender, then apply grammat
     return instruction
 
 
-def get_translation_config(system_instruction, model_name, thinking=True, thinking_budget=2048):
+def get_translation_config(system_instruction, model_name, thinking=True, thinking_budget=2048, temperature=None, top_p=None, top_k=None):
     """
     Build API configuration.
     Based on gemini-translator-srt's config builder with thinking mode support.
+
+    Args:
+        system_instruction: System instruction for the model
+        model_name: Name of the model to use
+        thinking: Whether to enable thinking mode
+        thinking_budget: Token budget for thinking (flash models only)
+        temperature: Controls randomness (0.0-2.0). Lower = more deterministic
+        top_p: Nucleus sampling parameter (0.0-1.0)
+        top_k: Top-K sampling parameter (integer >= 0)
     """
     # Response schema: array of {index, content} objects
     response_schema = types.Schema(
@@ -602,7 +611,8 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
     ]
 
     # Determine thinking mode compatibility
-    thinking_compatible = "2.5" in model_name or "2.0" in model_name
+    # Supports: Gemini 2.0, 2.5, and 3.x models
+    thinking_compatible = "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
     thinking_budget_compatible = "flash" in model_name
 
     # Build thinking config if compatible
@@ -620,7 +630,10 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
         response_schema=response_schema,
         safety_settings=safety_settings,
         system_instruction=system_instruction,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k
     )
 
 
@@ -882,11 +895,13 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                             # Show thinking indicator with elapsed time
                             thinking_minutes = int(thinking_elapsed // 60)
                             thinking_seconds = int(thinking_elapsed % 60)
+                            # Cap chunk_size to prevent exceeding total (defensive check)
+                            effective_chunk = min(chunk_count, max(0, total_lines - current_line))
                             progress_bar(
                                 current=current_line,
                                 total=total_lines,
                                 model_name=model_name,
-                                chunk_size=chunk_count,
+                                chunk_size=effective_chunk,
                                 is_thinking=True,
                                 thinking_time=f"({thinking_minutes}m {thinking_seconds}s)"
                             )
@@ -931,20 +946,24 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                                     _last_chunk_size = chunk_count
 
                                     # Update progress bar with real-time chunk progress
+                                    # Cap chunk_size to prevent exceeding total (defensive check)
+                                    effective_chunk = min(chunk_count, max(0, total_lines - current_line))
                                     progress_bar(
                                         current=current_line,
                                         total=total_lines,
                                         model_name=model_name,
-                                        chunk_size=chunk_count,
+                                        chunk_size=effective_chunk,
                                         is_loading=True
                                     )
                             except:
                                 # Can't parse yet, just show loading
+                                # Cap chunk_size to prevent exceeding total (defensive check)
+                                effective_chunk = min(chunk_count, max(0, total_lines - current_line))
                                 progress_bar(
                                     current=current_line,
                                     total=total_lines,
                                     model_name=model_name,
-                                    chunk_size=chunk_count,
+                                    chunk_size=effective_chunk,
                                     is_loading=True
                                 )
 
@@ -1080,7 +1099,7 @@ def save_incremental_output(subs, dialogue_events, translated_subtitle, original
 
 # --- Core Translation Function ---
 
-def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None, free_quota=True):
+def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None, free_quota=True, temperature=None, top_p=None, top_k=None):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
     Adapted from gemini-translator-srt's proven architecture.
@@ -1250,6 +1269,10 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 unique_text_indices[unique_text] = indices
                 lines_to_translate.append(first_idx)  # Track first occurrence for progress
 
+        # Sort lines_to_translate to ensure consistent ordering for progress tracking
+        # This is critical for resume logic to work correctly
+        lines_to_translate.sort()
+
         # Calculate total kept-as-is: Romaji lines + vector drawings + short Latin lines
         total_kept_as_is = excluded_count + vector_drawing_count + len(translation_map)
         total_original_lines = len(all_dialogue_events)
@@ -1314,7 +1337,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         # Configure API - get client from manager
         client = api_manager.get_client()
-        config = get_translation_config(system_instruction, model_name, thinking, thinking_budget)
+        config = get_translation_config(system_instruction, model_name, thinking, thinking_budget, temperature, top_p, top_k)
 
         # Process in batches (only translatable lines)
         # Use i to track current position in lines_to_translate (like gemini-translator-srt)
@@ -1327,6 +1350,16 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         # Skip until we find the dialogue line index that matches start_line
         while i < total and lines_to_translate[i] < start_line:
             i += 1
+
+        # Verify resume position matches expected (for debugging)
+        if start_line > 0:
+            # The actual position i should match completed_translatable
+            # If they differ, there may be an issue with how progress was saved/loaded
+            expected_completed = sum(1 for idx in lines_to_translate if idx < start_line)
+            if i != expected_completed:
+                logger.warning(f"Resume position mismatch: expected {expected_completed} but skipped to {i}")
+                logger.warning(f"This may cause progress display issues. Using actual position {i}.")
+            logging.debug(f"Resume: actual position i={i}, total={total}")
 
         # Build context if resuming
         if start_line > 0:
@@ -1688,7 +1721,7 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         return None
 
 
-def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, free_quota=True):
+def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, free_quota=True, temperature=None, top_p=None, top_k=None):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
     extracts, translates, and merges the chosen track.
@@ -1777,7 +1810,10 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
             audio_file,
             extract_audio,
             mkv_path,  # video_path for audio extraction
-            free_quota
+            free_quota,
+            temperature,
+            top_p,
+            top_k
         )
 
         # 5. Merge the translated subtitle back into a new MKV
@@ -1840,6 +1876,18 @@ def main():
                        help="Extract audio from video for gender-aware translation.")
     parser.add_argument("--paid-quota", action="store_true",
                        help="Remove artificial rate limits for paid quota users (allows faster processing).")
+    parser.add_argument("--temperature", type=float, default=None,
+                       help="Controls randomness in translation (0.0-2.0). "
+                            "Lower values = more deterministic/consistent. "
+                            "Higher values = more creative/varied. Default: model default.")
+    parser.add_argument("--top-p", type=float, default=None,
+                       help="Nucleus sampling parameter (0.0-1.0). "
+                            "Consider tokens with cumulative probability up to this value. "
+                            "Default: model default.")
+    parser.add_argument("--top-k", type=int, default=None,
+                       help="Top-K sampling parameter (integer >= 0). "
+                            "Consider only top K most likely tokens. "
+                            "Default: model default.")
     parser.add_argument("input_path", nargs="?", default=None, type=Path,
                        help="Path to a single .mkv file or directory containing .mkv files.")
 
@@ -1852,6 +1900,21 @@ def main():
     # Validate thinking_budget
     if args.thinking_budget < 0 or args.thinking_budget > 24576:
         logger.error("thinking-budget must be between 0 and 24576")
+        sys.exit(1)
+
+    # Validate temperature (0.0 to 2.0)
+    if args.temperature is not None and (args.temperature < 0 or args.temperature > 2):
+        logger.error("temperature must be between 0.0 and 2.0")
+        sys.exit(1)
+
+    # Validate top_p (0.0 to 1.0)
+    if args.top_p is not None and (args.top_p < 0 or args.top_p > 1):
+        logger.error("top-p must be between 0.0 and 1.0")
+        sys.exit(1)
+
+    # Validate top_k (>= 0)
+    if args.top_k is not None and args.top_k < 0:
+        logger.error("top-k must be a non-negative integer")
         sys.exit(1)
 
     # Info message for Pro models with thinking
@@ -1956,7 +2019,10 @@ def main():
                 args.keep_original,
                 args.audio_file,
                 args.extract_audio,
-                free_quota
+                free_quota,
+                args.temperature,
+                args.top_p,
+                args.top_k
             )
             # Remember language selection for subsequent files
             if chosen_lang and not remembered_lang:
