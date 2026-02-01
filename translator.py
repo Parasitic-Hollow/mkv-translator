@@ -25,22 +25,28 @@ import pysubs2
 try:
     import json_repair
 except ImportError:
-    logging.error("json_repair module not found. Install it with: pip install json-repair")
+    logging.error(
+        "json_repair module not found. Install it with: pip install json-repair"
+    )
     sys.exit(1)
 
 try:
     from audio_utils import prepare_audio
 except ImportError:
-    logging.error("audio_utils module not found. Please ensure audio_utils.py is in the same directory.")
+    logging.error(
+        "audio_utils module not found. Please ensure audio_utils.py is in the same directory."
+    )
     sys.exit(1)
 
 # --- API Manager for Dual API Key Support ---
+
 
 class APIManager:
     """
     Manages dual API key support for handling quota limitations.
     Matches gemini-srt-translator's _switch_api and _get_client pattern.
     """
+
     def __init__(self, api_key, api_key2=None):
         """
         Initialize API manager with primary and optional secondary API key.
@@ -97,30 +103,41 @@ class APIManager:
 # Import progress display module
 try:
     from progress_display import (
-        progress_bar, progress_complete, clear_progress,
-        info_with_progress, warning_with_progress, error_with_progress, success_with_progress
+        progress_bar,
+        progress_complete,
+        clear_progress,
+        info_with_progress,
+        warning_with_progress,
+        error_with_progress,
+        success_with_progress,
     )
 except ImportError:
-    logging.error("progress_display module not found. Make sure progress_display.py is in the same directory.")
+    logging.error(
+        "progress_display module not found. Make sure progress_display.py is in the same directory."
+    )
     sys.exit(1)
 
 # Import enhanced logger module
 try:
     import logger
 except ImportError:
-    logging.error("logger module not found. Make sure logger.py is in the same directory.")
+    logging.error(
+        "logger module not found. Make sure logger.py is in the same directory."
+    )
     sys.exit(1)
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # Suppress verbose HTTP logging from google/urllib and all submodules
-logging.getLogger('google').setLevel(logging.ERROR)
-logging.getLogger('google.genai').setLevel(logging.ERROR)
-logging.getLogger('google.ai').setLevel(logging.ERROR)
-logging.getLogger('urllib3').setLevel(logging.ERROR)
-logging.getLogger('httpx').setLevel(logging.ERROR)
-logging.getLogger('httpcore').setLevel(logging.ERROR)
+logging.getLogger("google").setLevel(logging.ERROR)
+logging.getLogger("google.genai").setLevel(logging.ERROR)
+logging.getLogger("google.ai").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
 
 # --- ASS Format Protection ---
 # Use token replacement to guarantee preservation of ASS directives
@@ -170,32 +187,156 @@ def restore_ass_directives(text):
     - <<<ASS_HLB>>> → \\N (hard line break)
     - <<<ASS_SLB>>> → \\n (soft line break)
     - <<<ASS_HSP>>> → \\h (hard space)
+
+    Also handles truncated/corrupted placeholders from LLM output:
+    - <<<ASS_HLB, <<<ASS_HL, etc. → \\N
     """
+    # First try exact matches
     text = text.replace(ASS_HARD_LINEBREAK_PLACEHOLDER, ASS_HARD_LINEBREAK)
     text = text.replace(ASS_SOFT_LINEBREAK_PLACEHOLDER, ASS_SOFT_LINEBREAK)
     text = text.replace(ASS_HARD_SPACE_PLACEHOLDER, ASS_HARD_SPACE)
+
+    # Handle truncated/corrupted placeholders with regex
+    # Gemini sometimes truncates placeholders at various points
+    # Match from most specific to least specific to avoid partial replacements
+
+    # Full or partial hard linebreak: <<<ASS_HLB>>>, <<<ASS_HL, <<<ASS_H, <<<ASS_, <<<ASS, <<<
+    text = re.sub(r"<<<(?:ASS_?(?:H(?:LB?)?)?)?(?:>>>|>>|>)?", r"\\N", text)
+
+    # Note: After the above regex, soft linebreak and hard space patterns would already
+    # be consumed. But we keep them for cases where S or HS appears (unlikely truncation path)
+    # These would only match if somehow <<<ASS_S or <<<ASS_HS survived the first pass
+    text = re.sub(r"<<<ASS_S(?:LB?)?(?:>>>|>>|>)?", r"\\n", text)
+    text = re.sub(r"<<<ASS_HS(?:P)?(?:>>>|>>|>)?", r"\\h", text)
+
     return text
 
 
 # --- ASS Formatting Helper Functions ---
 
+
 def remove_formatting(text):
     """Remove ASS formatting tags from text."""
-    return re.sub(r'\{.*?\}', '', text).strip()
+    return re.sub(r"\{.*?\}", "", text).strip()
+
 
 def restore_formatting(original_text, translated_plain_text):
     """
     Restore ASS formatting tags from original text to translated text.
     Preserves the structure of formatting tags from the original.
     """
-    formatting_tags = re.findall(r'\{[^}]+\}', original_text)
+    formatting_tags = re.findall(r"\{[^}]+\}", original_text)
 
     if not formatting_tags:
         return translated_plain_text
 
     # Prepend all formatting tags to the translated text
-    formatting_prefix = ''.join(formatting_tags)
+    formatting_prefix = "".join(formatting_tags)
     return f"{formatting_prefix}{translated_plain_text}"
+
+
+def strip_sdh_elements(text):
+    """
+    Remove SDH (Subtitles for Deaf and Hard of Hearing) elements from subtitle text.
+
+    Removes:
+    - Sound effects in brackets/parentheses: [door slams], (thunder rumbling), （日本語）, *footsteps*, /rustling/
+    - Speaker identification: JOHN:, Mary:, [narrator]:
+    - Music symbols (preserves lyrics): ♪ lyrics ♪ → lyrics
+    - Watermarks and credits: www.site.com, Subtitled by..., OpenSubtitles
+
+    Preserves:
+    - Actual dialogue content
+    - Music lyrics text (only symbols removed)
+    - ASS formatting tags {...} (handled separately by remove_formatting)
+    - Time patterns like 12:30 (not mistaken for speaker names)
+
+    Args:
+        text: Subtitle text to process
+
+    Returns:
+        Text with SDH elements removed
+    """
+    if not text:
+        return text
+
+    # 1. Remove sound effects in various bracket styles (including Japanese fullwidth)
+    text = re.sub(r"\[[^\]]*\]", "", text)  # [sound effect]
+    text = re.sub(r"\([^\)]*\)", "", text)  # (sound effect)
+    text = re.sub(r"（[^）]*）", "", text)  # （Japanese fullwidth parentheses）
+    text = re.sub(r"\*[^\*]+\*", "", text)  # *sound effect*
+    text = re.sub(r"/[^/]+/", "", text)  # /sound effect/
+
+    # 2. Remove music symbols but preserve lyrics
+    text = re.sub(r"♪([^♪]*)♪", r"\1", text)  # ♪ lyrics ♪ → lyrics
+    text = re.sub(r"[#♪♫]+", "", text)  # Remove standalone music symbols
+
+    # 3. Remove speaker names (ALL CAPS or Title Case) with colon
+    # Pattern explanation:
+    # - (?:\[[^\]]+\]\s*)? : Optional bracketed speaker like [narrator]
+    # - (?:-\s?)? : Optional leading dash
+    # - ([A-Z][A-Z0-9'\s]*|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*) : ALL CAPS or Title Case name
+    # - :\s? : Colon followed by optional space
+    # - (?![0-9]) : NOT followed by a number (avoids matching time like 12:30)
+    text = re.sub(
+        r"^(?:\[[^\]]+\]\s*)?(?:-\s?)?([A-Z][A-Z0-9\'\s]*|[A-Z][a-z]+(?:\s[A-Z][a-z]+)*):(?![0-9])\s?",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # 4. Remove watermarks and credits
+    text = re.sub(r"(?i)\b(subtitle|caption|sync)s?\s+(by|from)\b.*", "", text)
+    text = re.sub(r"(?i)www\.|https?://|\.(?:com|org|net)", "", text)
+    text = re.sub(r"(?i)(opensubtitles|subscene|addic7ed|podnapisi)", "", text)
+
+    # 5. Remove Unicode directional marks (LRM, RLM, etc.) and clean up whitespace
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def is_sdh_only_line(text):
+    """
+    Detect if a subtitle line contains ONLY SDH content (no actual dialogue).
+
+    Returns True for lines that should be deleted entirely:
+    - Entire line is bracketed: [MUSIC PLAYING], （音）
+    - Only music symbols: ♪♪♪, ###
+    - Only dashes: ---, ———
+    - Speaker name only: JOHN:, MARY:
+    - Empty or whitespace-only (including after Unicode marks removed)
+
+    Args:
+        text: Subtitle text to check
+
+    Returns:
+        True if line is SDH-only, False if it contains dialogue
+    """
+    if not text:
+        return True
+
+    # Remove Unicode directional marks before checking
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]+", "", text)
+    text = text.strip()
+
+    if not text:
+        return True
+
+    # Check for full-line SDH patterns
+    sdh_only_patterns = [
+        r"^[\[\(（].*[\]\)）]$",  # Entire line is bracketed (ASCII or Japanese)
+        r"^\s*[♪#♫\s]+$",  # Only music symbols and whitespace
+        r"^\s*[-–—]+\s*$",  # Only dashes
+        r"^[A-Z\s]+:$",  # Speaker name only (ALL CAPS with colon)
+    ]
+
+    for pattern in sdh_only_patterns:
+        if re.match(pattern, text):
+            return True
+
+    return False
 
 
 def normalize_ass_colors(ass_path):
@@ -222,7 +363,7 @@ def normalize_ass_colors(ass_path):
     - Partial hex: \\cFFF& → \\c&H000FFF& (padded to 6 digits)
     """
     try:
-        with open(ass_path, 'r', encoding='utf-8-sig') as f:
+        with open(ass_path, "r", encoding="utf-8-sig") as f:
             content = f.read()
 
         original_content = content
@@ -239,18 +380,18 @@ def normalize_ass_colors(ass_path):
             color_hex = match.group(2)  # Just the hex digits
 
             # Remove any non-hex characters that slipped through
-            clean_hex = re.sub(r'[^0-9A-Fa-f]', '', color_hex)
+            clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_hex)
 
             if not clean_hex:
                 # Invalid/empty color - remove the tag entirely
-                return ''
+                return ""
 
             # Parse hex value
             try:
                 color_value = int(clean_hex, 16)
             except ValueError:
                 # Should never happen after cleaning, but be safe
-                return ''
+                return ""
 
             # Normalize to proper length (pad with zeros if needed)
             # 6 digits = RGB, 8 digits = ARGB
@@ -266,10 +407,10 @@ def normalize_ass_colors(ass_path):
         # Replace all inline color tags
         # This pattern matches all variations: \c..., \1c..., \2c..., \3c..., \4c...
         content = re.sub(
-            r'\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])',
+            r"\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])",
             normalize_inline_color,
             content,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         )
 
         # === Style Line Color Normalization ===
@@ -286,11 +427,11 @@ def normalize_ass_colors(ass_path):
                 color_str = color_match.group(0)
 
                 # Extract just hex digits
-                clean_hex = re.sub(r'[^0-9A-Fa-f]', '', color_str)
+                clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_str)
 
                 if not clean_hex or len(clean_hex) > 8:
                     # Invalid - use white with full opacity as safe default
-                    return '&H00FFFFFF'
+                    return "&H00FFFFFF"
 
                 try:
                     color_value = int(clean_hex, 16)
@@ -301,26 +442,26 @@ def normalize_ass_colors(ass_path):
                     else:
                         return f"&H{color_value:08X}"
                 except ValueError:
-                    return '&H00FFFFFF'  # Safe default
+                    return "&H00FFFFFF"  # Safe default
 
             # Match color values in style (anywhere in the line after "Style:")
             # These are typically &HAABBGGRR or malformed versions
             # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
             line = re.sub(
-                r'(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)',
+                r"(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)",
                 fix_style_color,
                 line,
-                flags=re.IGNORECASE
+                flags=re.IGNORECASE,
             )
 
             return line
 
         # Normalize all Style: lines
         content = re.sub(
-            r'^Style:.*$',
+            r"^Style:.*$",
             normalize_style_line,
             content,
-            flags=re.MULTILINE | re.IGNORECASE
+            flags=re.MULTILINE | re.IGNORECASE,
         )
 
         # === Cleanup Pass ===
@@ -328,14 +469,14 @@ def normalize_ass_colors(ass_path):
         # These are patterns that look like color tags but are too malformed to fix
 
         # Remove standalone \c or \Xc without any hex following
-        content = re.sub(r'\\(\d?c)(?![&0-9A-Fa-f])', '', content)
+        content = re.sub(r"\\(\d?c)(?![&0-9A-Fa-f])", "", content)
 
         # Fix any remaining double ampersands
-        content = re.sub(r'&&+', '&', content)
+        content = re.sub(r"&&+", "&", content)
 
         # === Write if changed ===
         if content != original_content:
-            with open(ass_path, 'w', encoding='utf-8-sig') as f:
+            with open(ass_path, "w", encoding="utf-8-sig") as f:
                 f.write(content)
             logging.debug(f"Normalized ASS color codes in {ass_path.name}")
             return True
@@ -348,19 +489,28 @@ def normalize_ass_colors(ass_path):
         # Don't fail - let pysubs2 handle it
         return False
 
+
 # --- MKVToolNix Functions ---
+
 
 def check_mkvtoolnix():
     """Checks if mkvmerge and mkvextract are installed and in the PATH."""
     try:
-        subprocess.run(["mkvmerge", "--version"], check=True, capture_output=True, text=True)
-        subprocess.run(["mkvextract", "--version"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["mkvmerge", "--version"], check=True, capture_output=True, text=True
+        )
+        subprocess.run(
+            ["mkvextract", "--version"], check=True, capture_output=True, text=True
+        )
         logging.debug("MKVToolNix command-line tools found.")
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("MKVToolNix not found. Please install it from https://mkvtoolnix.download/")
+        logger.error(
+            "MKVToolNix not found. Please install it from https://mkvtoolnix.download/"
+        )
         logger.error("Ensure 'mkvmerge' and 'mkvextract' are in your system's PATH.")
         return False
+
 
 def select_subtitle_track(tracks, remembered_lang=None):
     """
@@ -368,24 +518,26 @@ def select_subtitle_track(tracks, remembered_lang=None):
     If a language has been previously selected, it defaults to that.
     Otherwise, prompts the user for selection if multiple are present.
     """
-    track_map = {'eng': [], 'de': [], 'ja': [], 'fr': []}
+    track_map = {"eng": [], "de": [], "ja": [], "fr": []}
 
     for track in tracks:
         if track.get("type") == "subtitles":
             lang = track.get("properties", {}).get("language")
             if lang == "eng":
-                track_map['eng'].append(track)
+                track_map["eng"].append(track)
             elif lang in ["de", "ger"]:
-                track_map['de'].append(track)
+                track_map["de"].append(track)
             elif lang in ["ja", "jpn"]:
-                track_map['ja'].append(track)
+                track_map["ja"].append(track)
             elif lang in ["fr", "fre", "fra"]:
-                track_map['fr'].append(track)
+                track_map["fr"].append(track)
 
     found_tracks = {lang: tracks for lang, tracks in track_map.items() if tracks}
 
     if remembered_lang and remembered_lang in found_tracks:
-        logger.info(f"Automatically selecting {remembered_lang} based on previous choice.")
+        logger.info(
+            f"Automatically selecting {remembered_lang} based on previous choice."
+        )
         return found_tracks[remembered_lang][0], remembered_lang
 
     if not found_tracks:
@@ -400,8 +552,14 @@ def select_subtitle_track(tracks, remembered_lang=None):
     lang_options = list(found_tracks.keys())
     print(f"Found multiple subtitle languages: {', '.join(lang_options)}")
     while True:
-        default_lang = 'eng' if 'eng' in lang_options else lang_options[0]
-        choice = input(f"Select language to process ({'/'.join(lang_options)}) [default: {default_lang}]: ").strip().lower()
+        default_lang = "eng" if "eng" in lang_options else lang_options[0]
+        choice = (
+            input(
+                f"Select language to process ({'/'.join(lang_options)}) [default: {default_lang}]: "
+            )
+            .strip()
+            .lower()
+        )
 
         if not choice:
             choice = default_lang
@@ -412,7 +570,9 @@ def select_subtitle_track(tracks, remembered_lang=None):
 
         print(f"Invalid choice. Please enter one of: {', '.join(lang_options)}.")
 
+
 # --- Progress Management Functions ---
+
 
 def save_progress(progress_file_path, current_line, total_lines, input_file):
     """
@@ -429,9 +589,9 @@ def save_progress(progress_file_path, current_line, total_lines, input_file):
             "line": current_line,
             "total": total_lines,
             "input_file": str(input_file),
-            "timestamp": time.time()
+            "timestamp": time.time(),
         }
-        with open(progress_file_path, 'w', encoding='utf-8') as f:
+        with open(progress_file_path, "w", encoding="utf-8") as f:
             json.dump(progress_data, f, indent=2)
         logging.debug(f"Progress saved: line {current_line}/{total_lines}")
     except Exception as e:
@@ -453,7 +613,7 @@ def load_progress(progress_file_path, input_file):
         return False, 1
 
     try:
-        with open(progress_file_path, 'r', encoding='utf-8') as f:
+        with open(progress_file_path, "r", encoding="utf-8") as f:
             progress_data = json.load(f)
 
         saved_line = progress_data.get("line", 1)
@@ -499,26 +659,36 @@ def prompt_resume(saved_line, total_lines):
     """
     percentage = (saved_line / total_lines) * 100 if total_lines > 0 else 0
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Previous translation was interrupted")
-    print(f"Progress: {saved_line}/{total_lines} translatable lines ({percentage:.1f}% complete)")
-    print(f"{'='*60}")
+    print(
+        f"Progress: {saved_line}/{total_lines} translatable lines ({percentage:.1f}% complete)"
+    )
+    print(f"{'=' * 60}")
 
     while True:
-        response = input("Resume from where you left off? (y/n) [default: y]: ").strip().lower()
+        response = (
+            input("Resume from where you left off? (y/n) [default: y]: ")
+            .strip()
+            .lower()
+        )
 
-        if response in ['', 'y', 'yes']:
+        if response in ["", "y", "yes"]:
             logger.info("Resuming from saved progress...")
             return True
-        elif response in ['n', 'no']:
+        elif response in ["n", "no"]:
             logger.info("Starting from beginning...")
             return False
         else:
             print("Please enter 'y' or 'n'")
 
+
 # --- Translation Helper Functions ---
 
-def get_system_instruction(source_lang, target_lang="Latin American Spanish", thinking=True, audio_file=None):
+
+def get_system_instruction(
+    source_lang, target_lang="Latin American Spanish", thinking=True, audio_file=None
+):
     """
     Generate system instruction for translation.
     Adapted from gemini-translator-srt's approach with thinking mode support.
@@ -531,13 +701,14 @@ def get_system_instruction(source_lang, target_lang="Latin American Spanish", th
 
     # Field definitions (conditional based on audio_file)
     fields = (
-        "- index: a string identifier\n"
-        "- content: the text to translate\n"
-        "- time_start: the start time of the segment\n"
-        "- time_end: the end time of the segment\n"
-    ) if audio_file else (
-        "- index: a string identifier\n"
-        "- content: the text to translate\n"
+        (
+            "- index: a string identifier\n"
+            "- content: the text to translate\n"
+            "- time_start: the start time of the segment\n"
+            "- time_end: the end time of the segment\n"
+        )
+        if audio_file
+        else ("- index: a string identifier\n- content: the text to translate\n")
     )
 
     instruction = f"""You are an assistant that translates subtitles from {source_lang} to {target_lang}.
@@ -575,7 +746,15 @@ Analyze the speaker's voice in the audio to determine gender, then apply grammat
     return instruction
 
 
-def get_translation_config(system_instruction, model_name, thinking=True, thinking_budget=2048, temperature=None, top_p=None, top_k=None):
+def get_translation_config(
+    system_instruction,
+    model_name,
+    thinking=True,
+    thinking_budget=2048,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
     """
     Build API configuration.
     Based on gemini-translator-srt's config builder with thinking mode support.
@@ -596,23 +775,33 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
             type=types.Type.OBJECT,
             properties={
                 "index": types.Schema(type=types.Type.STRING),
-                "content": types.Schema(type=types.Type.STRING)
+                "content": types.Schema(type=types.Type.STRING),
             },
-            required=["index", "content"]
-        )
+            required=["index", "content"],
+        ),
     )
 
     # Safety settings: allow all content (subtitles may contain mature content)
     safety_settings = [
-        types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
-        types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
-        types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='BLOCK_NONE'),
-        types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='BLOCK_NONE'),
+        types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+        ),
     ]
 
     # Determine thinking mode compatibility
     # Supports: Gemini 2.0, 2.5, and 3.x models
-    thinking_compatible = "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
+    thinking_compatible = (
+        "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
+    )
     thinking_budget_compatible = "flash" in model_name
 
     # Build thinking config if compatible
@@ -622,7 +811,7 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
     if thinking_compatible and thinking:
         thinking_config = types.ThinkingConfig(
             include_thoughts=True,
-            thinking_budget=thinking_budget if thinking_budget_compatible else None
+            thinking_budget=thinking_budget if thinking_budget_compatible else None,
         )
 
     return types.GenerateContentConfig(
@@ -633,7 +822,7 @@ def get_translation_config(system_instruction, model_name, thinking=True, thinki
         thinking_config=thinking_config,
         temperature=temperature,
         top_p=top_p,
-        top_k=top_k
+        top_k=top_k,
     )
 
 
@@ -646,7 +835,12 @@ def is_rtl(text):
         return False
 
     count = Counter([unicodedata.bidirectional(c) for c in text])
-    rtl_count = count.get("R", 0) + count.get("AL", 0) + count.get("RLE", 0) + count.get("RLI", 0)
+    rtl_count = (
+        count.get("R", 0)
+        + count.get("AL", 0)
+        + count.get("RLE", 0)
+        + count.get("RLI", 0)
+    )
     ltr_count = count.get("L", 0) + count.get("LRE", 0) + count.get("LRI", 0)
 
     return rtl_count > ltr_count
@@ -674,14 +868,14 @@ def is_primarily_latin(text):
 
     for char in text:
         # Skip whitespace and punctuation
-        if char.isspace() or unicodedata.category(char).startswith('P'):
+        if char.isspace() or unicodedata.category(char).startswith("P"):
             continue
 
         # Check Unicode script
         try:
             script_name = unicodedata.name(char).split()[0]
             # Latin includes basic ASCII and extended Latin characters
-            if ord(char) < 128 or 'LATIN' in script_name:
+            if ord(char) < 128 or "LATIN" in script_name:
                 latin_count += 1
             else:
                 other_count += 1
@@ -708,8 +902,7 @@ def validate_batch_tokens(client, batch, model_name):
     try:
         # Use the ACTUAL model for token counting
         token_count = client.models.count_tokens(
-            model=model_name,
-            contents=json.dumps(batch, ensure_ascii=False)
+            model=model_name, contents=json.dumps(batch, ensure_ascii=False)
         )
 
         # Set token limits based on model (conservative estimates)
@@ -721,7 +914,9 @@ def validate_batch_tokens(client, batch, model_name):
 
         if token_count.total_tokens > token_limit * 0.9:
             # Token limit exceeded - will be shown after clearing progress bar
-            logger.error(f"Token count ({token_count.total_tokens}) exceeds 90% of limit ({token_limit})")
+            logger.error(
+                f"Token count ({token_count.total_tokens}) exceeds 90% of limit ({token_limit})"
+            )
             return False
 
         logging.debug(f"Token validation passed: {token_count.total_tokens} tokens")
@@ -782,13 +977,20 @@ def build_resume_context(dialogue_lines, translated_subtitle, start_line, batch_
     ]
 
     return [
-        types.Content(role="user", parts=[types.Part(text=json.dumps(original_batch, ensure_ascii=False))]),
-        types.Content(role="model", parts=[types.Part(text=json.dumps(translated_batch, ensure_ascii=False))])
+        types.Content(
+            role="user",
+            parts=[types.Part(text=json.dumps(original_batch, ensure_ascii=False))],
+        ),
+        types.Content(
+            role="model",
+            parts=[types.Part(text=json.dumps(translated_batch, ensure_ascii=False))],
+        ),
     ]
 
 
 # Global variable to track last successful chunk size (like gemini-translator-srt)
 _last_chunk_size = 0
+
 
 def get_last_chunk_size():
     """Get the number of lines successfully translated in the last batch."""
@@ -796,9 +998,23 @@ def get_last_chunk_size():
     return _last_chunk_size
 
 
-def process_batch_streaming(client, model_name, batch, previous_message, translated_subtitle, config,
-                           current_line, total_lines, batch_number=1, keep_original=False, original_format=".ass", audio_part=None, audio_file=None,
-                           dialogue_lines=None, unique_text_indices=None):
+def process_batch_streaming(
+    client,
+    model_name,
+    batch,
+    previous_message,
+    translated_subtitle,
+    config,
+    current_line,
+    total_lines,
+    batch_number=1,
+    keep_original=False,
+    original_format=".ass",
+    audio_part=None,
+    audio_file=None,
+    dialogue_lines=None,
+    unique_text_indices=None,
+):
     """
     Process a batch with streaming responses and real-time progress display.
     Implements retry loop matching gemini-srt-translator's _process_batch pattern.
@@ -859,9 +1075,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                 break  # Exit retry loop if previously blocked
 
             response = client.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=config
+                model=model_name, contents=contents, config=config
             )
 
             for chunk in response:
@@ -886,7 +1100,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                             thinking_elapsed = time.time() - thinking_start_time
                             if thinking_elapsed > thinking_timeout_seconds:
                                 warning_with_progress(
-                                    f"Thinking exceeded {thinking_timeout_seconds//60} minutes. "
+                                    f"Thinking exceeded {thinking_timeout_seconds // 60} minutes. "
                                     f"Retrying batch (attempt {retry + 1}/{max_retries_on_timeout})..."
                                 )
                                 timed_out = True
@@ -896,14 +1110,16 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                             thinking_minutes = int(thinking_elapsed // 60)
                             thinking_seconds = int(thinking_elapsed % 60)
                             # Cap chunk_size to prevent exceeding total (defensive check)
-                            effective_chunk = min(chunk_count, max(0, total_lines - current_line))
+                            effective_chunk = min(
+                                chunk_count, max(0, total_lines - current_line)
+                            )
                             progress_bar(
                                 current=current_line,
                                 total=total_lines,
                                 model_name=model_name,
                                 chunk_size=effective_chunk,
                                 is_thinking=True,
-                                thinking_time=f"({thinking_minutes}m {thinking_seconds}s)"
+                                thinking_time=f"({thinking_minutes}m {thinking_seconds}s)",
                             )
                         else:
                             response_text += part.text
@@ -927,44 +1143,69 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                                                 content = f"\u202b{content}\u202c"
 
                                             # Add original text as hidden comment if --keep-original flag is enabled (ASS only)
-                                            if keep_original and original_format == ".ass":
-                                                original_text = original_texts.get(idx, "")
+                                            if (
+                                                keep_original
+                                                and original_format == ".ass"
+                                            ):
+                                                original_text = original_texts.get(
+                                                    idx, ""
+                                                )
                                                 if original_text:
                                                     content = f"{{Original: {original_text}}}{content}"
 
                                             translated_subtitle[idx] = content
 
                                             # Apply translation to all duplicates of this text
-                                            if dialogue_lines is not None and unique_text_indices is not None:
-                                                original_text_content = dialogue_lines[idx].strip()
-                                                if original_text_content in unique_text_indices:
-                                                    for duplicate_idx in unique_text_indices[original_text_content]:
-                                                        if duplicate_idx != idx:  # Skip the one we just translated
-                                                            translated_subtitle[duplicate_idx] = content
+                                            if (
+                                                dialogue_lines is not None
+                                                and unique_text_indices is not None
+                                            ):
+                                                original_text_content = dialogue_lines[
+                                                    idx
+                                                ].strip()
+                                                if (
+                                                    original_text_content
+                                                    in unique_text_indices
+                                                ):
+                                                    for (
+                                                        duplicate_idx
+                                                    ) in unique_text_indices[
+                                                        original_text_content
+                                                    ]:
+                                                        if (
+                                                            duplicate_idx != idx
+                                                        ):  # Skip the one we just translated
+                                                            translated_subtitle[
+                                                                duplicate_idx
+                                                            ] = content
 
                                     # Update global chunk size for error recovery
                                     _last_chunk_size = chunk_count
 
                                     # Update progress bar with real-time chunk progress
                                     # Cap chunk_size to prevent exceeding total (defensive check)
-                                    effective_chunk = min(chunk_count, max(0, total_lines - current_line))
+                                    effective_chunk = min(
+                                        chunk_count, max(0, total_lines - current_line)
+                                    )
                                     progress_bar(
                                         current=current_line,
                                         total=total_lines,
                                         model_name=model_name,
                                         chunk_size=effective_chunk,
-                                        is_loading=True
+                                        is_loading=True,
                                     )
                             except:
                                 # Can't parse yet, just show loading
                                 # Cap chunk_size to prevent exceeding total (defensive check)
-                                effective_chunk = min(chunk_count, max(0, total_lines - current_line))
+                                effective_chunk = min(
+                                    chunk_count, max(0, total_lines - current_line)
+                                )
                                 progress_bar(
                                     current=current_line,
                                     total=total_lines,
                                     model_name=model_name,
                                     chunk_size=effective_chunk,
-                                    is_loading=True
+                                    is_loading=True,
                                 )
 
                 # If timeout occurred during part processing, break chunk loop
@@ -975,7 +1216,9 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
             if timed_out:
                 if retry < max_retries_on_timeout:
                     clear_progress()
-                    warning_with_progress(f"Thinking timeout. Retrying (attempt {retry + 1}/{max_retries_on_timeout})...")
+                    warning_with_progress(
+                        f"Thinking timeout. Retrying (attempt {retry + 1}/{max_retries_on_timeout})..."
+                    )
                     time.sleep(2)  # Brief pause before retry
                     continue
                 else:
@@ -1058,6 +1301,7 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
                 "Try changing your description (if you have one) and/or the batch size and try again."
             )
             import signal
+
             signal.raise_signal(signal.SIGINT)
 
         # Save thoughts to file if enabled
@@ -1071,15 +1315,20 @@ def process_batch_streaming(client, model_name, batch, previous_message, transla
         response_parts.append(types.Part(text=final_response_text))
 
         return [
-            types.Content(role="user", parts=[types.Part(text=json.dumps(batch, ensure_ascii=False))]),
-            types.Content(role="model", parts=response_parts)
+            types.Content(
+                role="user",
+                parts=[types.Part(text=json.dumps(batch, ensure_ascii=False))],
+            ),
+            types.Content(role="model", parts=response_parts),
         ]
     finally:
         # Restore logging level
         logging.getLogger().setLevel(old_level)
 
 
-def save_incremental_output(subs, dialogue_events, translated_subtitle, original_texts, output_path):
+def save_incremental_output(
+    subs, dialogue_events, translated_subtitle, original_texts, output_path
+):
     """
     Save partial output after each batch.
     Allows recovery even if final save fails.
@@ -1099,7 +1348,28 @@ def save_incremental_output(subs, dialogue_events, translated_subtitle, original
 
 # --- Core Translation Function ---
 
-def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_mkv_stem, lang_code, original_format=".ass", batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, video_path=None, free_quota=True, temperature=None, top_p=None, top_k=None):
+
+def translate_ass_file(
+    ass_path,
+    api_manager,
+    model_name,
+    output_dir,
+    original_mkv_stem,
+    lang_code,
+    original_format=".ass",
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    audio_file=None,
+    extract_audio=False,
+    video_path=None,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
     Adapted from gemini-translator-srt's proven architecture.
@@ -1139,12 +1409,16 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         # Extract audio from video if requested
         if video_path and extract_audio:
             if video_path.exists():
-                logger.info("Extracting audio from video for gender-aware translation...")
+                logger.info(
+                    "Extracting audio from video for gender-aware translation..."
+                )
                 audio_file = prepare_audio(str(video_path))
                 if audio_file:
                     audio_extracted = True
                 else:
-                    logger.warning("Failed to extract audio. Continuing without audio context.")
+                    logger.warning(
+                        "Failed to extract audio. Continuing without audio context."
+                    )
             else:
                 logger.error(f"Video file {video_path} does not exist.")
 
@@ -1153,7 +1427,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             logger.info(f"Loading audio file: {Path(audio_file).name}")
             with open(audio_file, "rb") as f:
                 audio_bytes = f.read()
-                audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg")
+                audio_part = types.Part.from_bytes(
+                    data=audio_bytes, mime_type="audio/mpeg"
+                )
             logger.info("Audio loaded successfully. Gender-aware translation enabled.")
         elif audio_file:
             logger.error(f"Audio file {audio_file} does not exist.")
@@ -1167,7 +1443,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             subs = pysubs2.load(str(ass_path))
         except Exception as e:
             logger.error(f"Failed to parse ASS file {ass_path.name}: {e}")
-            logger.error("Note: Color normalization was already applied. This may be a different parsing error.")
+            logger.error(
+                "Note: Color normalization was already applied. This may be a different parsing error."
+            )
             return None, batch_size
 
         if not subs:
@@ -1178,18 +1456,23 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         dialogue_events = []
         dialogue_lines = []
         original_texts = []
+        sdh_events_to_remove = []  # Track SDH-only events to remove from output
 
-        all_dialogue_events = [line for line in subs if hasattr(line, 'type') and line.type == "Dialogue"]
+        all_dialogue_events = [
+            line for line in subs if hasattr(line, "type") and line.type == "Dialogue"
+        ]
 
         if not all_dialogue_events:
-            event_types = set(getattr(line, 'type', 'Unknown') for line in subs)
-            logger.warning(f"No Dialogue events found in {ass_path.name}. Found event types: {event_types}")
+            event_types = set(getattr(line, "type", "Unknown") for line in subs)
+            logger.warning(
+                f"No Dialogue events found in {ass_path.name}. Found event types: {event_types}"
+            )
             return None, batch_size
 
         # Styles to exclude from translation (romanized lyrics - already readable)
         EXCLUDE_STYLES = [
-            r'.*Romaji$',       # Matches: OP-Romaji, ED-Romaji, Insert-Romaji
-            r'.*Romaji[- ]',    # Matches: Romaji-Top, Romaji Bottom
+            r".*Romaji$",  # Matches: OP-Romaji, ED-Romaji, Insert-Romaji
+            r".*Romaji[- ]",  # Matches: Romaji-Top, Romaji Bottom
         ]
 
         def should_exclude_style(style_name):
@@ -1201,8 +1484,20 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     return True
             return False
 
-        ass_header_keywords = ["[Script Info]", "[V4+ Styles]", "[Events]", "[Aegisub", "Format:", "Style:",
-                               "ScriptType:", "PlayResX:", "PlayResY:", "WrapStyle:", "Title:", "Collisions:"]
+        ass_header_keywords = [
+            "[Script Info]",
+            "[V4+ Styles]",
+            "[Events]",
+            "[Aegisub",
+            "Format:",
+            "Style:",
+            "ScriptType:",
+            "PlayResX:",
+            "PlayResY:",
+            "WrapStyle:",
+            "Title:",
+            "Collisions:",
+        ]
 
         excluded_count = 0
         vector_drawing_count = 0
@@ -1214,7 +1509,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
             # Skip vector drawings (lines with \p1, \p2, etc. - no text to translate)
             # These are shapes/animations like Sign - Mask
-            if r'\p1' in event.text or r'\p2' in event.text or r'\p3' in event.text or r'\p4' in event.text:
+            if (
+                r"\p1" in event.text
+                or r"\p2" in event.text
+                or r"\p3" in event.text
+                or r"\p4" in event.text
+            ):
                 vector_drawing_count += 1
                 continue
 
@@ -1223,9 +1523,24 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 if plain_text:
                     # Protect ASS directives (like \N) before translation
                     protected_text = protect_ass_directives(plain_text)
+
+                    # Apply SDH stripping if enabled
+                    if strip_sdh:
+                        protected_text = strip_sdh_elements(protected_text)
+                        # Skip events that become empty or SDH-only after stripping
+                        if not protected_text or is_sdh_only_line(protected_text):
+                            sdh_events_to_remove.append(event)
+                            continue
+
                     dialogue_events.append(event)
                     dialogue_lines.append(protected_text)
                     original_texts.append(event.text)
+
+        # Log SDH stripping stats if enabled
+        if strip_sdh and sdh_events_to_remove:
+            logger.info(
+                f"Removed {len(sdh_events_to_remove)} SDH-only lines (sound effects, speaker names, etc.)"
+            )
 
         if not dialogue_lines:
             logger.warning(f"No valid dialogue lines found in {ass_path.name}.")
@@ -1244,7 +1559,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         duplicate_count = total_lines - len(text_to_indices)
         if duplicate_count > 0:
-            logger.info(f"Found {duplicate_count} duplicate lines (same text with different effects)")
+            logger.info(
+                f"Found {duplicate_count} duplicate lines (same text with different effects)"
+            )
 
         # Filter out lines too short to translate meaningfully
         # Only apply length filter to Latin/ASCII text (CJK can be meaningful in 1-2 chars)
@@ -1259,7 +1576,10 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
             # Only apply MIN_TRANSLATION_LENGTH to Latin scripts
             # CJK, Arabic, Cyrillic, etc. can convey meaning in 1-2 characters
-            if is_primarily_latin(unique_text) and len(unique_text) < MIN_TRANSLATION_LENGTH:
+            if (
+                is_primarily_latin(unique_text)
+                and len(unique_text) < MIN_TRANSLATION_LENGTH
+            ):
                 # Keep very short Latin text as-is (e.g., "OK", "Hi", "!")
                 for idx in indices:
                     translation_map[idx] = dialogue_lines[idx]
@@ -1267,7 +1587,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 # This text needs translation (either non-Latin or long enough)
                 unique_texts_to_translate.append(unique_text)
                 unique_text_indices[unique_text] = indices
-                lines_to_translate.append(first_idx)  # Track first occurrence for progress
+                lines_to_translate.append(
+                    first_idx
+                )  # Track first occurrence for progress
 
         # Sort lines_to_translate to ensure consistent ordering for progress tracking
         # This is critical for resume logic to work correctly
@@ -1279,15 +1601,23 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         # Show clean summary (total original lines = unique texts to translate + duplicates + kept as-is)
         unique_count = len(unique_texts_to_translate)
-        print(f"Found {total_original_lines} dialogue lines ({unique_count} unique texts to translate, {total_kept_as_is} kept as-is)\n")
+        print(
+            f"Found {total_original_lines} dialogue lines ({unique_count} unique texts to translate, {total_kept_as_is} kept as-is)\n"
+        )
 
         if duplicate_count > 0:
-            logger.info(f"Deduplication: {duplicate_count} duplicate lines (same text with different effects)")
+            logger.info(
+                f"Deduplication: {duplicate_count} duplicate lines (same text with different effects)"
+            )
         if vector_drawing_count > 0:
-            logger.info(f"Excluded {vector_drawing_count} vector drawing lines (shapes/animations)")
+            logger.info(
+                f"Excluded {vector_drawing_count} vector drawing lines (shapes/animations)"
+            )
 
         if not lines_to_translate:
-            logger.warning(f"No lines to translate in {ass_path.name} (all lines too short). Skipping.")
+            logger.warning(
+                f"No lines to translate in {ass_path.name} (all lines too short). Skipping."
+            )
             # Just use the original lines - no translation needed
             for i, event in enumerate(dialogue_events):
                 # Still need to restore ASS directives even for untranslated lines
@@ -1299,31 +1629,45 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
         # Check for saved progress
         start_line = 0  # ASS dialogue events are 0-indexed
-        translated_subtitle = dialogue_lines.copy()  # Start with original text (short lines stay as-is)
+        translated_subtitle = (
+            dialogue_lines.copy()
+        )  # Start with original text (short lines stay as-is)
 
         if progress_file_path.exists():
             has_progress, saved_line = load_progress(progress_file_path, ass_path)
             if has_progress:
                 # Calculate how many translatable lines have been completed
-                completed_translatable = sum(1 for idx in lines_to_translate if idx < saved_line)
+                completed_translatable = sum(
+                    1 for idx in lines_to_translate if idx < saved_line
+                )
 
                 # Only prompt to resume if we've actually translated something
-                if completed_translatable > 0 and prompt_resume(completed_translatable, len(lines_to_translate)):
+                if completed_translatable > 0 and prompt_resume(
+                    completed_translatable, len(lines_to_translate)
+                ):
                     start_line = saved_line
 
                     # Load partial output if it exists
                     if output_ass_path.exists():
                         try:
                             partial_subs = pysubs2.load(str(output_ass_path))
-                            partial_events = [e for e in partial_subs if hasattr(e, 'type') and e.type == "Dialogue"]
+                            partial_events = [
+                                e
+                                for e in partial_subs
+                                if hasattr(e, "type") and e.type == "Dialogue"
+                            ]
 
                             # Extract already translated lines (load ALL events, not just [:start_line])
                             # This matches gemini-srt-translator's approach (line 352)
                             for i, event in enumerate(partial_events):
                                 if i < len(translated_subtitle):
-                                    translated_subtitle[i] = remove_formatting(event.text)
+                                    translated_subtitle[i] = remove_formatting(
+                                        event.text
+                                    )
 
-                            logger.info(f"Loaded {completed_translatable} previously translated lines")
+                            logger.info(
+                                f"Loaded {completed_translatable} previously translated lines"
+                            )
                         except Exception as e:
                             logger.warning(f"Failed to load partial output: {e}")
                 else:
@@ -1333,11 +1677,24 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     progress_file_path.unlink()
 
         # Build system instruction (with audio context if available)
-        system_instruction = get_system_instruction(lang_code, target_lang="Latin American Spanish", thinking=thinking, audio_file=audio_file)
+        system_instruction = get_system_instruction(
+            lang_code,
+            target_lang="Latin American Spanish",
+            thinking=thinking,
+            audio_file=audio_file,
+        )
 
         # Configure API - get client from manager
         client = api_manager.get_client()
-        config = get_translation_config(system_instruction, model_name, thinking, thinking_budget, temperature, top_p, top_k)
+        config = get_translation_config(
+            system_instruction,
+            model_name,
+            thinking,
+            thinking_budget,
+            temperature,
+            top_p,
+            top_k,
+        )
 
         # Process in batches (only translatable lines)
         # Use i to track current position in lines_to_translate (like gemini-translator-srt)
@@ -1355,19 +1712,22 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         if start_line > 0:
             # The actual position i should match completed_translatable
             # If they differ, there may be an issue with how progress was saved/loaded
-            expected_completed = sum(1 for idx in lines_to_translate if idx < start_line)
+            expected_completed = sum(
+                1 for idx in lines_to_translate if idx < start_line
+            )
             if i != expected_completed:
-                logger.warning(f"Resume position mismatch: expected {expected_completed} but skipped to {i}")
-                logger.warning(f"This may cause progress display issues. Using actual position {i}.")
+                logger.warning(
+                    f"Resume position mismatch: expected {expected_completed} but skipped to {i}"
+                )
+                logger.warning(
+                    f"This may cause progress display issues. Using actual position {i}."
+                )
             logging.debug(f"Resume: actual position i={i}, total={total}")
 
         # Build context if resuming
         if start_line > 0:
             previous_message = build_resume_context(
-                dialogue_lines,
-                translated_subtitle,
-                start_line,
-                batch_size
+                dialogue_lines, translated_subtitle, start_line, batch_size
             )
 
         # Signal handler for graceful interruption (matching gemini-srt-translator)
@@ -1388,7 +1748,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 dialogue_events=dialogue_events,
                 translated_subtitle=translated_subtitle,
                 original_texts=original_texts,
-                output_path=output_ass_path
+                output_path=output_ass_path,
             )
 
             # Save logs
@@ -1399,7 +1759,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 current_position = max(1, i - len(batch) + max(0, last_chunk_size - 1))
                 if current_position < len(lines_to_translate):
                     current_dialogue_line = lines_to_translate[current_position]
-                    save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
+                    save_progress(
+                        progress_file_path, current_dialogue_line, total_lines, ass_path
+                    )
 
             sys.exit(0)
 
@@ -1419,17 +1781,14 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     logger.info("Pro model and free user quota detected.\n")
                 else:
                     delay_time = 15
-                    logger.info("Pro model and free user quota detected, using secondary API key if needed.\n")
+                    logger.info(
+                        "Pro model and free user quota detected, using secondary API key if needed.\n"
+                    )
             else:
                 logger.info("Paid quota mode enabled - no artificial rate limiting.\n")
 
         # Show initial progress bar (matching gemini-srt-translator line 460)
-        progress_bar(
-            current=i,
-            total=total,
-            model_name=model_name,
-            is_sending=True
-        )
+        progress_bar(current=i, total=total, model_name=model_name, is_sending=True)
 
         # Main translation loop (like gemini-translator-srt lines 489-606)
         batch = []  # Initialize batch outside loop for signal handler access
@@ -1443,7 +1802,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 line_idx = lines_to_translate[i]
                 batch_item = {
                     "index": str(line_idx),
-                    "content": dialogue_lines[line_idx]
+                    "content": dialogue_lines[line_idx],
                 }
                 # Add time codes if audio is present (for gender-aware translation)
                 if audio_file:
@@ -1479,7 +1838,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     current=batch_start_i,
                     total=total,
                     model_name=model_name,
-                    is_sending=True
+                    is_sending=True,
                 )
 
                 # Track batch processing time for rate limiting (gemini-srt-translator line 537)
@@ -1500,7 +1859,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     audio_part=audio_part,
                     audio_file=audio_file,
                     dialogue_lines=dialogue_lines,
-                    unique_text_indices=unique_text_indices
+                    unique_text_indices=unique_text_indices,
                 )
                 batch_number += 1  # Increment for next batch
 
@@ -1510,7 +1869,9 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     current_dialogue_line = lines_to_translate[i]
                 else:
                     current_dialogue_line = total_lines
-                save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
+                save_progress(
+                    progress_file_path, current_dialogue_line, total_lines, ass_path
+                )
 
                 # Save logs incrementally after each batch
                 logger.save_logs()
@@ -1521,7 +1882,7 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     dialogue_events=dialogue_events,
                     translated_subtitle=translated_subtitle,
                     original_texts=original_texts,
-                    output_path=output_ass_path
+                    output_path=output_ass_path,
                 )
 
                 batch.clear()
@@ -1539,7 +1900,11 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                 clear_progress()
 
                 # Handle quota errors with API switching or wait (gemini-srt-translator lines 553-564)
-                if "quota" in error_msg.lower() or "503" in error_msg or "UNAVAILABLE" in error_msg:
+                if (
+                    "quota" in error_msg.lower()
+                    or "503" in error_msg
+                    or "UNAVAILABLE" in error_msg
+                ):
                     current_time = time.time()
 
                     # Try switching API if:
@@ -1578,7 +1943,13 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
 
                         # Countdown wait
                         for j in range(60, 0, -1):
-                            progress_bar(batch_start_i, total, model_name, is_retrying=True, retry_countdown=j)
+                            progress_bar(
+                                batch_start_i,
+                                total,
+                                model_name,
+                                is_retrying=True,
+                                retry_countdown=j,
+                            )
                             time.sleep(1)
 
                     # Update last quota error timestamp
@@ -1603,7 +1974,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                     # Save progress
                     if i < len(lines_to_translate):
                         current_dialogue_line = lines_to_translate[i]
-                        save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
+                        save_progress(
+                            progress_file_path,
+                            current_dialogue_line,
+                            total_lines,
+                            ass_path,
+                        )
 
                     # Save incremental output with partial success
                     save_incremental_output(
@@ -1611,22 +1987,20 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
                         dialogue_events=dialogue_events,
                         translated_subtitle=translated_subtitle,
                         original_texts=original_texts,
-                        output_path=output_ass_path
+                        output_path=output_ass_path,
                     )
 
                 # Resume progress bar
-                progress_bar(
-                    current=i,
-                    total=total,
-                    model_name=model_name
-                )
+                progress_bar(current=i, total=total, model_name=model_name)
 
         # Show completion
         progress_complete(total, total, model_name)
 
         # Final validation
         if len(translated_subtitle) != len(dialogue_lines):
-            logger.error(f"Line count mismatch: {len(translated_subtitle)} vs {len(dialogue_lines)}")
+            logger.error(
+                f"Line count mismatch: {len(translated_subtitle)} vs {len(dialogue_lines)}"
+            )
             return None, batch_size
 
         # Restore ASS formatting to final translations
@@ -1636,9 +2010,17 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
             # Then restore ASS formatting tags
             event.text = restore_formatting(original_texts[i], restored_directives)
 
+        # Remove SDH-only events from the subtitle file before saving
+        if strip_sdh and sdh_events_to_remove:
+            for event in sdh_events_to_remove:
+                if event in subs:
+                    subs.remove(event)
+
         # Save final output
         subs.save(str(output_ass_path))
-        logger.success(f"Successfully created translated subtitle file: {output_ass_path.name}")
+        logger.success(
+            f"Successfully created translated subtitle file: {output_ass_path.name}"
+        )
 
         # Clean up progress file
         if progress_file_path.exists():
@@ -1658,10 +2040,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
     except KeyboardInterrupt:
         clear_progress()
         logger.warning("\nTranslation interrupted by user!")
-        if 'i' in locals() and i < len(lines_to_translate):
+        if "i" in locals() and i < len(lines_to_translate):
             # Save the current dialogue line index
             current_dialogue_line = lines_to_translate[i]
-            save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
+            save_progress(
+                progress_file_path, current_dialogue_line, total_lines, ass_path
+            )
             logger.info("Progress saved. Run again to resume.")
         logger.save_logs()
         return None, batch_size
@@ -1670,10 +2054,12 @@ def translate_ass_file(ass_path, api_manager, model_name, output_dir, original_m
         clear_progress()
         logger.error(f"Translation failed: {e}")
         logger.save_logs()
-        if 'i' in locals() and i < len(lines_to_translate):
+        if "i" in locals() and i < len(lines_to_translate):
             # Save the current dialogue line index
             current_dialogue_line = lines_to_translate[i]
-            save_progress(progress_file_path, current_dialogue_line, total_lines, ass_path)
+            save_progress(
+                progress_file_path, current_dialogue_line, total_lines, ass_path
+            )
         return None, batch_size
 
 
@@ -1685,31 +2071,45 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         output_mkv_name = f"{mkv_path.stem}.translated.mkv"
         output_mkv_path = output_mkv_dir / output_mkv_name
 
-        logger.info(f"Merging translated subtitles into new file: {output_mkv_path.name}")
+        logger.info(
+            f"Merging translated subtitles into new file: {output_mkv_path.name}"
+        )
 
         mkvmerge_cmd = [
             "mkvmerge",
-            "-o", str(output_mkv_path),
-            "--language", f"0:es-419",
-            "--track-name", "0:Spanish (Latin America)",
-            "--default-track-flag", "0:yes",
+            "-o",
+            str(output_mkv_path),
+            "--language",
+            f"0:es-419",
+            "--track-name",
+            "0:Spanish (Latin America)",
+            "--default-track-flag",
+            "0:yes",
             str(translated_subtitle_path),
-            str(mkv_path)
+            str(mkv_path),
         ]
 
-        result = subprocess.run(mkvmerge_cmd, capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(
+            mkvmerge_cmd, capture_output=True, text=True, encoding="utf-8"
+        )
 
         # mkvmerge exit codes: 0=success, 1=warnings (still successful), 2+=error
         if result.returncode == 0:
-            logger.success(f"Successfully created merged MKV file: {output_mkv_path.name}")
+            logger.success(
+                f"Successfully created merged MKV file: {output_mkv_path.name}"
+            )
             return output_mkv_path
         elif result.returncode == 1:
-            logger.success(f"Successfully created merged MKV file: {output_mkv_path.name}")
+            logger.success(
+                f"Successfully created merged MKV file: {output_mkv_path.name}"
+            )
             if result.stderr:
                 logger.warning(f"mkvmerge warnings: {result.stderr.strip()}")
             return output_mkv_path
         else:
-            logger.error(f"Failed to merge subtitles for {mkv_path.name}: {result.stderr}")
+            logger.error(
+                f"Failed to merge subtitles for {mkv_path.name}: {result.stderr}"
+            )
             return None
 
     except subprocess.CalledProcessError as e:
@@ -1717,11 +2117,30 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         logger.error(f"Failed to merge subtitles for {mkv_path.name}: {e.stderr}")
         return None
     except Exception as e:
-        logger.error(f"An unexpected error occurred during merging for {mkv_path.name}: {e}")
+        logger.error(
+            f"An unexpected error occurred during merging for {mkv_path.name}: {e}"
+        )
         return None
 
 
-def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_lang=None, batch_size=300, thinking=True, thinking_budget=2048, keep_original=False, audio_file=None, extract_audio=False, free_quota=True, temperature=None, top_p=None, top_k=None):
+def process_mkv_file(
+    mkv_path,
+    output_dir,
+    api_manager,
+    model_name,
+    remembered_lang=None,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    audio_file=None,
+    extract_audio=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
     extracts, translates, and merges the chosen track.
@@ -1731,16 +2150,16 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
         free_quota: If True (default), apply rate limiting for free tier users.
                    If False (--paid-quota), remove artificial delays for paid users.
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Processing: {mkv_path.name}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Pre-flight check
     expected_output_name = f"{mkv_path.stem}.translated.mkv"
     expected_output_path = output_dir / expected_output_name
 
     if expected_output_path.exists():
-        logger.info(f"Output file \'{expected_output_name}\' already exists. Skipping.")
+        logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
         return None, batch_size
 
     tmp_dir = Path("tmp")
@@ -1749,14 +2168,20 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
     try:
         # 1. Identify tracks using mkvmerge
         mkvmerge_cmd = ["mkvmerge", "-J", str(mkv_path)]
-        result = subprocess.run(mkvmerge_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(
+            mkvmerge_cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+        )
         mkv_info = json.loads(result.stdout)
 
         # 2. Select subtitle track
-        selected_track, lang_code = select_subtitle_track(mkv_info.get("tracks", []), remembered_lang)
+        selected_track, lang_code = select_subtitle_track(
+            mkv_info.get("tracks", []), remembered_lang
+        )
 
         if selected_track is None:
-            logger.warning(f"No suitable subtitle track found in {mkv_path.name}. Skipping.")
+            logger.warning(
+                f"No suitable subtitle track found in {mkv_path.name}. Skipping."
+            )
             return None, batch_size
 
         # 3. Check for supported subtitle format and extract the track
@@ -1764,25 +2189,43 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
         supported_codecs = {
             "S_TEXT/ASS": ".ass",
             "S_TEXT/SSA": ".ssa",
-            "S_TEXT/UTF8": ".srt"
+            "S_TEXT/UTF8": ".srt",
         }
 
         if codec_id not in supported_codecs:
-            logger.warning(f"Unsupported subtitle format \'{codec_id}\' in {mkv_path.name}. Skipping.")
+            logger.warning(
+                f"Unsupported subtitle format '{codec_id}' in {mkv_path.name}. Skipping."
+            )
             return None, batch_size
 
-        subtitle_track_id = selected_track['id']
+        subtitle_track_id = selected_track["id"]
         subtitle_extension = supported_codecs[codec_id]
 
-        extracted_ass_path = tmp_dir / f"{mkv_path.stem}.{lang_code}{subtitle_extension}"
-        mkvextract_cmd = ["mkvextract", "tracks", str(mkv_path), f"{subtitle_track_id}:{extracted_ass_path}"]
-        logging.debug(f"Extracting track {subtitle_track_id} ({lang_code}, {codec_id}) to: {extracted_ass_path}")
+        extracted_ass_path = (
+            tmp_dir / f"{mkv_path.stem}.{lang_code}{subtitle_extension}"
+        )
+        mkvextract_cmd = [
+            "mkvextract",
+            "tracks",
+            str(mkv_path),
+            f"{subtitle_track_id}:{extracted_ass_path}",
+        ]
+        logging.debug(
+            f"Extracting track {subtitle_track_id} ({lang_code}, {codec_id}) to: {extracted_ass_path}"
+        )
 
-        result = subprocess.run(mkvextract_cmd, capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(
+            mkvextract_cmd, capture_output=True, text=True, encoding="utf-8"
+        )
 
         # Check for MKV corruption
-        if "Error in the Matroska file structure" in result.stdout or "Resync failed" in result.stdout:
-            logger.warning(f"MKV file {mkv_path.name} appears to be corrupted. Skipping.")
+        if (
+            "Error in the Matroska file structure" in result.stdout
+            or "Resync failed" in result.stdout
+        ):
+            logger.warning(
+                f"MKV file {mkv_path.name} appears to be corrupted. Skipping."
+            )
             if extracted_ass_path.is_file():
                 extracted_ass_path.unlink()
             return None, batch_size
@@ -1813,7 +2256,8 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
             free_quota,
             temperature,
             top_p,
-            top_k
+            top_k,
+            strip_sdh,
         )
 
         # 5. Merge the translated subtitle back into a new MKV
@@ -1823,7 +2267,9 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
         return lang_code, final_batch_size
 
     except FileNotFoundError:
-        logger.error("mkvmerge or mkvextract not found. Please ensure MKVToolNix is installed.")
+        logger.error(
+            "mkvmerge or mkvextract not found. Please ensure MKVToolNix is installed."
+        )
     except subprocess.CalledProcessError as e:
         logger.error(f"Command-line tool failed for {mkv_path.name}: {e}")
     except json.JSONDecodeError:
@@ -1836,60 +2282,132 @@ def process_mkv_file(mkv_path, output_dir, api_manager, model_name, remembered_l
 
 # --- Main Execution ---
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini.\n\n"
-                    "Usage:\n"
-                    "  %(prog)s <file.mkv>              # Process a single file\n"
-                    "  %(prog)s <directory>             # Process all .mkv files in directory",
-        formatter_class=argparse.RawTextHelpFormatter
+        "Usage:\n"
+        "  %(prog)s <file.mkv>              # Process a single file\n"
+        "  %(prog)s <directory>             # Process all .mkv files in directory",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument("--api-key", help="Primary API key for Google Gemini (or set GEMINI_API_KEY env var).")
-    parser.add_argument("--api-key2", help="Secondary API key for additional quota (optional).")
-    parser.add_argument("--model", default="gemini-2.5-pro",
-                       help="The model to use for translation (default: 'gemini-2.5-pro'). "
-                            "Note: Pro models may take longer for thinking, but have automatic timeout/retry.")
-    parser.add_argument("--list-models", action="store_true",
-                       help="List available Gemini models and exit.")
-    parser.add_argument("--output-dir", type=Path, default=Path("translated_subs"),
-                       help="Directory to save translated files.")
-    parser.add_argument("--batch-size", type=int, default=300,
-                       help="Number of lines to translate per batch (default: 300).")
-    parser.add_argument("--thinking", action="store_true", default=True,
-                       help="Enable thinking mode for better translations (default: enabled for Gemini 2.5+).")
-    parser.add_argument("--no-thinking", action="store_true",
-                       help="Disable thinking mode.")
-    parser.add_argument("--thinking-budget", type=int, default=2048,
-                       help="Token budget for thinking process (0-24576, only for flash models, default: 2048).")
-    parser.add_argument("--progress-log", action="store_true",
-                       help="Save translation progress to a log file.")
-    parser.add_argument("--thoughts-log", action="store_true",
-                       help="Save thinking process to a separate log file (requires thinking mode).")
-    parser.add_argument("--no-colors", action="store_true",
-                       help="Disable colored output.")
-    parser.add_argument("--keep-original", action="store_true",
-                       help="Keep original text as hidden comments in ASS subtitles (format: {Original: text}translation).")
-    parser.add_argument("-a", "--audio-file", type=Path, default=None,
-                       help="Audio file for gender-aware translation (MP3 format recommended).")
-    parser.add_argument("--extract-audio", action="store_true",
-                       help="Extract audio from video for gender-aware translation.")
-    parser.add_argument("--paid-quota", action="store_true",
-                       help="Remove artificial rate limits for paid quota users (allows faster processing).")
-    parser.add_argument("--temperature", type=float, default=None,
-                       help="Controls randomness in translation (0.0-2.0). "
-                            "Lower values = more deterministic/consistent. "
-                            "Higher values = more creative/varied. Default: model default.")
-    parser.add_argument("--top-p", type=float, default=None,
-                       help="Nucleus sampling parameter (0.0-1.0). "
-                            "Consider tokens with cumulative probability up to this value. "
-                            "Default: model default.")
-    parser.add_argument("--top-k", type=int, default=None,
-                       help="Top-K sampling parameter (integer >= 0). "
-                            "Consider only top K most likely tokens. "
-                            "Default: model default.")
-    parser.add_argument("input_path", nargs="?", default=None, type=Path,
-                       help="Path to a single .mkv file or directory containing .mkv files.")
+    parser.add_argument(
+        "--api-key",
+        help="Primary API key for Google Gemini (or set GEMINI_API_KEY env var).",
+    )
+    parser.add_argument(
+        "--api-key2", help="Secondary API key for additional quota (optional)."
+    )
+    parser.add_argument(
+        "--model",
+        default="gemini-2.5-pro",
+        help="The model to use for translation (default: 'gemini-2.5-pro'). "
+        "Note: Pro models may take longer for thinking, but have automatic timeout/retry.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available Gemini models and exit.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("translated_subs"),
+        help="Directory to save translated files.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=300,
+        help="Number of lines to translate per batch (default: 300).",
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        default=True,
+        help="Enable thinking mode for better translations (default: enabled for Gemini 2.5+).",
+    )
+    parser.add_argument(
+        "--no-thinking", action="store_true", help="Disable thinking mode."
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=2048,
+        help="Token budget for thinking process (0-24576, only for flash models, default: 2048).",
+    )
+    parser.add_argument(
+        "--progress-log",
+        action="store_true",
+        help="Save translation progress to a log file.",
+    )
+    parser.add_argument(
+        "--thoughts-log",
+        action="store_true",
+        help="Save thinking process to a separate log file (requires thinking mode).",
+    )
+    parser.add_argument(
+        "--no-colors", action="store_true", help="Disable colored output."
+    )
+    parser.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="Keep original text as hidden comments in ASS subtitles (format: {Original: text}translation).",
+    )
+    parser.add_argument(
+        "-a",
+        "--audio-file",
+        type=Path,
+        default=None,
+        help="Audio file for gender-aware translation (MP3 format recommended).",
+    )
+    parser.add_argument(
+        "--extract-audio",
+        action="store_true",
+        help="Extract audio from video for gender-aware translation.",
+    )
+    parser.add_argument(
+        "--strip-sdh",
+        action="store_true",
+        help="Remove SDH (Subtitles for Deaf/Hard of Hearing) elements like [sound effects], speaker names, and music symbols.",
+    )
+    parser.add_argument(
+        "--paid-quota",
+        action="store_true",
+        help="Remove artificial rate limits for paid quota users (allows faster processing).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Controls randomness in translation (0.0-2.0). "
+        "Lower values = more deterministic/consistent. "
+        "Higher values = more creative/varied. Default: model default.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Nucleus sampling parameter (0.0-1.0). "
+        "Consider tokens with cumulative probability up to this value. "
+        "Default: model default.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-K sampling parameter (integer >= 0). "
+        "Consider only top K most likely tokens. "
+        "Default: model default.",
+    )
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        default=None,
+        type=Path,
+        help="Path to a single .mkv file or directory containing .mkv files.",
+    )
 
     args = parser.parse_args()
 
@@ -1918,7 +2436,11 @@ def main():
         sys.exit(1)
 
     # Info message for Pro models with thinking
-    if args.thinking and "pro" in args.model.lower() and "flash" not in args.model.lower():
+    if (
+        args.thinking
+        and "pro" in args.model.lower()
+        and "flash" not in args.model.lower()
+    ):
         logger.info(
             f"Using {args.model} with thinking mode enabled.\n"
             f"Pro models may take longer to think (5+ minutes per batch is normal).\n"
@@ -1937,7 +2459,10 @@ def main():
         else:
             # Use environment variable for primary key
             import os
-            env_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+
+            env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+                "GOOGLE_API_KEY"
+            )
             if not env_key:
                 raise ValueError("No API key provided")
             api_manager = APIManager(env_key, args.api_key2)
@@ -1952,7 +2477,9 @@ def main():
 
     except Exception as e:
         logger.error(f"Failed to initialize Google Gemini client: {e}")
-        logger.error("Make sure you provide --api-key or set GEMINI_API_KEY/GOOGLE_API_KEY environment variable")
+        logger.error(
+            "Make sure you provide --api-key or set GEMINI_API_KEY/GOOGLE_API_KEY environment variable"
+        )
         sys.exit(1)
 
     # Handle --list-models before checking other args
@@ -2022,14 +2549,17 @@ def main():
                 free_quota,
                 args.temperature,
                 args.top_p,
-                args.top_k
+                args.top_k,
+                args.strip_sdh,
             )
             # Remember language selection for subsequent files
             if chosen_lang and not remembered_lang:
                 remembered_lang = chosen_lang
             # Remember batch size adjustment for subsequent files
             if final_batch_size and final_batch_size != remembered_batch_size:
-                logger.info(f"Batch size adjusted to {final_batch_size} - will use for remaining files")
+                logger.info(
+                    f"Batch size adjusted to {final_batch_size} - will use for remaining files"
+                )
                 remembered_batch_size = final_batch_size
 
     logger.success("--- All files processed. ---")
