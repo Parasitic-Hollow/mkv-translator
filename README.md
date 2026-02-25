@@ -99,7 +99,7 @@ python3 translator.py [OPTIONS] INPUT_PATH
 **API Configuration:**
 - `--api-key KEY` - Primary Gemini API key (required if not set as environment variable)
 - `--api-key2 KEY` - Secondary API key for automatic failover when quota is reached
-- `--model NAME` - Gemini model to use (default: `gemini-2.5-pro`)
+- `--model NAME` - Gemini model to use (default: `gemini-3.1-pro-preview`)
 - `--list-models` - List all available Gemini models and exit
 
 **Translation Options:**
@@ -159,7 +159,7 @@ python3 translator.py \
 ```bash
 python3 translator.py \
   --api-key YOUR_KEY \
-  --model gemini-1.5-flash \
+  --model gemini-3.1-pro-preview \
   video.mkv
 ```
 
@@ -320,7 +320,7 @@ The tool applies intelligent filtering based on script type:
 **Poor translation quality**
 - Ensure `--thinking` mode is enabled (default)
 - Increase `--thinking-budget` (e.g., `--thinking-budget 4096`)
-- Try a more capable model (e.g., `--model gemini-1.5-pro`)
+- Try a more capable model (e.g., `--model gemini-3.1-pro-preview`)
 
 **Colors not working in terminal**
 - Some terminals don't support ANSI colors

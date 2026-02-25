@@ -2301,8 +2301,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.5-pro",
-        help="The model to use for translation (default: 'gemini-2.5-pro'). "
+        default="gemini-3.1-pro-preview",
+        help="The model to use for translation (default: 'gemini-3.1-pro-preview'). "
         "Note: Pro models may take longer for thinking, but have automatic timeout/retry.",
     )
     parser.add_argument(
