@@ -184,9 +184,26 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
 - `--strip-sdh` - remove SDH elements like speaker names and sound-effect captions
+- `--review` - force the AI review pass after translation (skip the interactive prompt)
+- `--no-review` - skip the AI review pass entirely (no prompt, no review)
+- `--review-batch-size N` - lines per review batch (default 150)
 - `--temperature FLOAT` - sampling temperature
 - `--top-p FLOAT` - nucleus sampling value
 - `--top-k INT` - top-k sampling value
+
+## AI Review Pass
+
+After translation, the tool can optionally run a second pass to check for quality issues:
+
+- **Gender agreement** — mismatched adjectives, verbs, or pronouns vs. established speaker gender
+- **Untranslated source text** — words or phrases left in the source language
+- **Terminology consistency** — same term translated differently across lines
+- **Register consistency** — unjustified tú/usted switches for the same character
+- **Pronoun and reference errors** — wrong gender on pronouns, dangling references
+
+By default you'll be asked interactively whether to run the review. Use `--review` to always run it or `--no-review` to skip the prompt entirely.
+
+The review pass uses the same provider and model as the translation pass. For Ollama cloud models, review calls use streaming to avoid timeouts.
 
 ## Output
 

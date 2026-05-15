@@ -952,6 +952,77 @@ def is_sdh_only_line(text):
     return False
 
 
+def _normalize_inline_color(match):
+    """Normalize a single inline color tag (\\c, \\1c, etc.)."""
+    tag = match.group(1)  # 'c' or '1c' or '2c' or '3c' or '4c'
+    color_hex = match.group(2)  # Just the hex digits
+
+    # Remove any non-hex characters that slipped through
+    clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_hex)
+
+    if not clean_hex:
+        # Invalid/empty color - remove the tag entirely
+        return ""
+
+    # Parse hex value
+    try:
+        color_value = int(clean_hex, 16)
+    except ValueError:
+        # Should never happen after cleaning, but be safe
+        return ""
+
+    # Normalize to proper length (pad with zeros if needed)
+    # 6 digits = RGB, 8 digits = ARGB
+    if len(clean_hex) <= 6:
+        # RGB format - pad to 6 digits
+        normalized = f"&H{color_value:06X}&"
+    else:
+        # ARGB format - pad to 8 digits
+        normalized = f"&H{color_value:08X}&"
+
+    return f"\\{tag}{normalized}"
+
+
+def _normalize_style_line(match):
+    """Normalize colors in a Style: line."""
+    line = match.group(0)
+
+    # Find and normalize each color value in the style
+    # Pattern: color values start with &H or H or just hex digits
+    def fix_style_color(color_match):
+        color_str = color_match.group(0)
+
+        # Extract just hex digits
+        clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_str)
+
+        if not clean_hex or len(clean_hex) > 8:
+            # Invalid - use white with full opacity as safe default
+            return "&H00FFFFFF"
+
+        try:
+            color_value = int(clean_hex, 16)
+            # Style colors should be 8 digits (AABBGGRR)
+            # If shorter, assume RGB and add full opacity (00)
+            if len(clean_hex) <= 6:
+                return f"&H00{color_value:06X}"
+            else:
+                return f"&H{color_value:08X}"
+        except ValueError:
+            return "&H00FFFFFF"  # Safe default
+
+    # Match color values in style (anywhere in the line after "Style:")
+    # These are typically &HAABBGGRR or malformed versions
+    # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
+    line = re.sub(
+        r"(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)",
+        fix_style_color,
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    return line
+
+
 def normalize_ass_colors(ass_path):
     """
     Normalize ALL ASS color codes to spec-compliant format in a single pass.
@@ -977,120 +1048,59 @@ def normalize_ass_colors(ass_path):
     """
     try:
         with open(ass_path, "r", encoding="utf-8-sig") as f:
-            content = f.read()
+            lines = f.readlines()
 
-        original_content = content
+        new_lines = []
+        changed = False
 
-        # === Inline Color Tag Normalization ===
-        # Matches: \c, \1c, \2c, \3c, \4c followed by color in any format
-        # Pattern breakdown:
-        # - \\(\d?c) : Matches \c or \1c-\4c
-        # - (?:&H?)?([0-9A-Fa-f]+)&? : Matches color with optional &H and trailing &
+        for line in lines:
+            # Skip lines that contain vector drawing commands (\p1, \p2, etc.)
+            # Drawing data contains numeric coordinates that can be confused with color values
+            if re.search(r'\\p[1-4](?!\d)', line):
+                # This line has drawing commands - skip color normalization entirely
+                # to avoid corrupting coordinate data
+                new_lines.append(line)
+                continue
 
-        def normalize_inline_color(match):
-            """Normalize a single inline color tag."""
-            tag = match.group(1)  # 'c' or '1c' or '2c' or '3c' or '4c'
-            color_hex = match.group(2)  # Just the hex digits
+            new_line = line
 
-            # Remove any non-hex characters that slipped through
-            clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_hex)
-
-            if not clean_hex:
-                # Invalid/empty color - remove the tag entirely
-                return ""
-
-            # Parse hex value
-            try:
-                color_value = int(clean_hex, 16)
-            except ValueError:
-                # Should never happen after cleaning, but be safe
-                return ""
-
-            # Normalize to proper length (pad with zeros if needed)
-            # 6 digits = RGB, 8 digits = ARGB
-            if len(clean_hex) <= 6:
-                # RGB format - pad to 6 digits
-                normalized = f"&H{color_value:06X}&"
-            else:
-                # ARGB format - pad to 8 digits
-                normalized = f"&H{color_value:08X}&"
-
-            return f"\\{tag}{normalized}"
-
-        # Replace all inline color tags
-        # This pattern matches all variations: \c..., \1c..., \2c..., \3c..., \4c...
-        content = re.sub(
-            r"\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])",
-            normalize_inline_color,
-            content,
-            flags=re.IGNORECASE,
-        )
-
-        # === Style Line Color Normalization ===
-        # Style lines have colors in specific comma-separated positions
-        # Format: Style: Name,Font,Size,PrimaryColour,SecondaryColour,OutlineColour,BackColour,...
-
-        def normalize_style_line(match):
-            """Normalize colors in a Style: line."""
-            line = match.group(0)
-
-            # Find and normalize each color value in the style
-            # Pattern: color values start with &H or H or just hex digits
-            def fix_style_color(color_match):
-                color_str = color_match.group(0)
-
-                # Extract just hex digits
-                clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_str)
-
-                if not clean_hex or len(clean_hex) > 8:
-                    # Invalid - use white with full opacity as safe default
-                    return "&H00FFFFFF"
-
-                try:
-                    color_value = int(clean_hex, 16)
-                    # Style colors should be 8 digits (AABBGGRR)
-                    # If shorter, assume RGB and add full opacity (00)
-                    if len(clean_hex) <= 6:
-                        return f"&H00{color_value:06X}"
-                    else:
-                        return f"&H{color_value:08X}"
-                except ValueError:
-                    return "&H00FFFFFF"  # Safe default
-
-            # Match color values in style (anywhere in the line after "Style:")
-            # These are typically &HAABBGGRR or malformed versions
-            # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
-            line = re.sub(
-                r"(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)",
-                fix_style_color,
-                line,
+            # === Inline Color Tag Normalization ===
+            new_line = re.sub(
+                r"\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])",
+                _normalize_inline_color,
+                new_line,
                 flags=re.IGNORECASE,
             )
 
-            return line
+            # === Style Line Color Normalization ===
+            if new_line.startswith("Style:"):
+                new_line = re.sub(
+                    r"^Style:.*$",
+                    _normalize_style_line,
+                    new_line,
+                    flags=re.MULTILINE | re.IGNORECASE,
+                )
 
-        # Normalize all Style: lines
-        content = re.sub(
-            r"^Style:.*$",
-            normalize_style_line,
-            content,
-            flags=re.MULTILINE | re.IGNORECASE,
-        )
+            if new_line != line:
+                changed = True
+            new_lines.append(new_line)
 
         # === Cleanup Pass ===
         # Remove any orphaned/incomplete color tags that might cause issues
         # These are patterns that look like color tags but are too malformed to fix
+        result = "".join(new_lines)
 
         # Remove standalone \c or \Xc without any hex following
-        content = re.sub(r"\\(\d?c)(?![&0-9A-Fa-f])", "", content)
+        result = re.sub(r"\\(\d?c)(?![&0-9A-Fa-f])", "", result)
 
         # Fix any remaining double ampersands
-        content = re.sub(r"&&+", "&", content)
+        result = re.sub(r"&&+", "&", result)
 
         # === Write if changed ===
-        if content != original_content:
+        original_content = "".join(lines)
+        if result != original_content:
             with open(ass_path, "w", encoding="utf-8-sig") as f:
-                f.write(content)
+                f.write(result)
             logging.debug(f"Normalized ASS color codes in {ass_path.name}")
             return True
 
@@ -1864,6 +1874,324 @@ Do not invent facts that are not present in the source line, nearby lines, or th
     return instruction
 
 
+def get_review_system_instruction(source_lang, target_lang="Latin American Spanish", extra_context_text=None):
+    """
+    Generate system instruction for the translation review pass.
+    Reviews gender agreement, consistency, untranslated leaks, and register issues.
+    """
+    instruction = f"""You are a meticulous translation proofreader. You will review subtitles translated from {source_lang} to {target_lang} and fix every real error you find.
+
+INPUT FORMAT — a JSON array where each object has:
+- index: line number (string)
+- original: source text
+- translated: current translation
+
+Carefully compare each original against its translation. Check for:
+1. **Gender agreement**: Adjectives, past participles, and verbs must match the speaker's established gender. "Ella está cansada" is correct for a woman; "Ella está cansado" is an error. Use surrounding lines and context to determine who is speaking or being spoken about.
+2. **Untranslated source text**: Any word or phrase left in {source_lang} that belongs in {target_lang}. Proper nouns and intentional loanwords are fine; everything else must be translated.
+3. **Terminology consistency**: The same concept, name, or term should be translated the same way every time. "Chairman Park" should not become "Director Park" halfway through.
+4. **Register consistency**: If a character uses tú with someone, keep tú. If usted, keep usted. A sudden switch without reason is an error.
+5. **Pronoun and reference errors**: Wrong gender on pronouns, dangling references, or subject-verb disagreements.
+
+Be thorough. A single wrong gender ending or missed untranslated word is a real, noticeable error — flag it. It is better to over-correct than to let mistakes through.
+
+OUTPUT FORMAT — a JSON array of objects:
+- index: the line index (string) to correct
+- corrected: the full corrected line with all formatting preserved
+- reason: short explanation of what was wrong
+
+Preserve all ASS override tags exactly ({{\\\\an8}}, {{\\\\i1}}, {{\\\\b0}}, colors, positions, etc.). Preserve \\\\N line breaks. Only change the translation text itself.
+
+Do NOT return an empty array unless every single line is truly correct. Most translations have at least a few real errors."""
+
+    if extra_context_text:
+        instruction += f"""
+
+Additional context about this subtitle file:
+{extra_context_text}
+
+Use this to identify character genders, relationships, and proper terminology."""
+
+    return instruction
+
+
+def get_review_config(system_instruction, model_name, thinking=True, thinking_budget=2048, temperature=None, top_p=None, top_k=None, provider="gemini"):
+    """Build API configuration for the translation review pass."""
+    if is_gemini_provider(provider):
+        response_schema = types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "index": types.Schema(type=types.Type.STRING),
+                    "corrected": types.Schema(type=types.Type.STRING),
+                    "reason": types.Schema(type=types.Type.STRING),
+                },
+                required=["index", "corrected", "reason"],
+            ),
+        )
+
+        thinking_compatible = (
+            "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
+        )
+        thinking_budget_compatible = "flash" in model_name
+
+        thinking_config = None
+        if thinking_compatible and thinking:
+            thinking_config = types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget=thinking_budget if thinking_budget_compatible else None,
+            )
+
+        return types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            safety_settings=get_safety_settings(),
+            system_instruction=system_instruction,
+            thinking_config=thinking_config,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+    return {
+        "provider": provider,
+        "system_instruction": system_instruction,
+        "think": get_ollama_think_value(model_name, thinking, thinking_budget),
+        "format": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "string"},
+                    "corrected": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "corrected", "reason"],
+            },
+        },
+        "options": {
+            key: value
+            for key, value in {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            }.items()
+            if value is not None
+        },
+    }
+
+
+def review_translation(
+    dialogue_events,
+    original_texts,
+    translated_subtitle,
+    source_lang,
+    target_lang,
+    api_manager,
+    model_name,
+    thinking=True,
+    thinking_budget=2048,
+    extra_context_text=None,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    review_batch_size=150,
+):
+    """
+    Review translated subtitles for gender, consistency, and quality issues.
+
+    Sends batches of (original, translated) pairs to the LLM and applies
+    any corrections returned.
+
+    Args:
+        dialogue_events: List of ASS subtitle events
+        original_texts: List of original (stripped) texts for each event
+        translated_subtitle: List of translated texts for each event
+        source_lang: Source language name/code
+        target_lang: Target language name (default "Latin American Spanish")
+        api_manager: APIManager instance for LLM calls
+        model_name: Model to use for review
+        thinking: Whether to enable thinking mode
+        thinking_budget: Token budget for thinking
+        extra_context_text: Optional extra context from user
+        temperature: Sampling temperature
+        top_p: Nucleus sampling
+        top_k: Top-K sampling
+        review_batch_size: Lines per review batch (default 150)
+
+    Returns:
+        Number of corrections applied
+    """
+    from tools.progress_display import progress_bar, progress_complete, clear_progress
+
+    provider = api_manager.provider
+    client = api_manager.get_client()
+
+    system_instruction = get_review_system_instruction(
+        source_lang, target_lang, extra_context_text=extra_context_text
+    )
+    config = get_review_config(
+        system_instruction, model_name,
+        thinking=thinking, thinking_budget=thinking_budget,
+        temperature=temperature, top_p=top_p, top_k=top_k,
+        provider=provider,
+    )
+
+    total_lines = len(dialogue_events)
+    total_corrections = 0
+
+    logger.info(f"Reviewing {total_lines} translated lines for quality issues...")
+
+    # Build index->position map for fast lookup
+    # Process in batches for context
+    for batch_start in range(0, total_lines, review_batch_size):
+        batch_end = min(batch_start + review_batch_size, total_lines)
+        batch_indices = list(range(batch_start, batch_end))
+
+        # Build the review payload
+        review_items = []
+        for i in batch_indices:
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            review_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+
+        # Include overlap context: add a few lines before and after for cross-batch consistency
+        overlap_before = max(0, batch_start - 5)
+        overlap_after = min(total_lines, batch_end + 5)
+        # Overlap lines are sent as context but not marked for correction
+        context_items = []
+        for i in range(overlap_before, batch_start):
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            context_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+        for i in range(batch_end, overlap_after):
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            context_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+
+        # Combine: context + review items
+        all_items = context_items[:5] + review_items + context_items[5:]
+        # Mark which indices are reviewable (batch range)
+        reviewable_indices = set(str(i) for i in batch_indices)
+
+        progress_bar(current=batch_start, total=total_lines, model_name=model_name, task_label="Reviewing")
+
+        json_payload = json.dumps(all_items, ensure_ascii=False)
+
+        # Build the user message
+        user_message = f"Review the following subtitle translation batch. Lines with indices {min(batch_indices)}-{max(batch_indices)} are the ones to check. Surrounding lines are context only — do NOT correct context lines, only lines in the target range.\n\n{json_payload}"
+
+        try:
+            if is_gemini_provider(provider):
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=user_message,
+                    config=config,
+                )
+                response_text = response.text
+            else:
+                # Ollama path — use streaming to avoid timeouts on cloud models
+                ollama_messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_message},
+                ]
+                ollama_options = config.get("options", {})
+                think = config.get("think", False)
+
+                chat_kwargs = {
+                    "model": model_name,
+                    "messages": ollama_messages,
+                    "stream": True,
+                    "format": config.get("format", "json"),
+                    "think": think,
+                }
+                if ollama_options:
+                    chat_kwargs["options"] = ollama_options
+
+                response = client.chat(**chat_kwargs)
+                response_text = ""
+                for chunk in response:
+                    chunk_text = extract_ollama_chunk_text(chunk)
+                    if chunk_text:
+                        response_text += chunk_text
+
+            # Parse the corrections
+            try:
+                corrections = json_repair.loads(response_text)
+            except Exception:
+                corrections = json.loads(response_text)
+
+            if not isinstance(corrections, list):
+                corrections = []
+
+            # Apply corrections (only for indices in the reviewable range)
+            batch_corrections = 0
+            for correction in corrections:
+                idx_str = str(correction.get("index", ""))
+                if idx_str not in reviewable_indices:
+                    continue
+                idx = int(idx_str)
+                corrected_text = correction.get("corrected", "")
+                reason = correction.get("reason", "")
+                if not corrected_text:
+                    continue
+                if idx < 0 or idx >= len(translated_subtitle):
+                    continue
+
+                old_text = translated_subtitle[idx]
+                if corrected_text != old_text:
+                    translated_subtitle[idx] = corrected_text
+                    # Also update the event text (restore formatting will be re-applied)
+                    if dialogue_events and idx < len(dialogue_events):
+                        # Re-apply ASS formatting restoration to the corrected text
+                        restored_directives = restore_ass_directives(corrected_text)
+                        dialogue_events[idx].text = restore_formatting(
+                            original_texts[idx], restored_directives
+                        )
+                    batch_corrections += 1
+                    logging.info(
+                        f"  Review corrected line {idx}: {reason}"
+                    )
+                    logging.debug(
+                        f"    Old: {old_text!r}\n    New: {corrected_text!r}"
+                    )
+
+            total_corrections += batch_corrections
+            if batch_corrections > 0:
+                logger.info(
+                    f"  Review batch {batch_start // review_batch_size + 1}: "
+                    f"{batch_corrections} correction(s) applied"
+                )
+
+        except Exception as e:
+            logger.warning(f"Review batch failed (non-fatal): {e}")
+            # Review is best-effort; continue with the next batch
+
+    progress_complete(total_lines, total_lines, model_name)
+
+    if total_corrections > 0:
+        logger.success(
+            f"Review complete: {total_corrections} correction(s) applied across {total_lines} lines"
+        )
+    else:
+        logger.info("Review complete: no corrections needed")
+
+    return total_corrections
+
+
 def get_safety_settings():
     """Build permissive safety settings for subtitle translation content."""
     return [
@@ -2219,13 +2547,68 @@ def build_resume_context(
     ]
 
 
+def _parse_ass_timestamp(ts_str):
+    """Parse ASS timestamp (H:MM:SS.CC or 0:00:00.00) to milliseconds."""
+    ts_str = ts_str.strip()
+    # Remove any trailing non-numeric junk (e.g., color codes mixed in)
+    ts_str = re.sub(r'[^0-9.:].*$', '', ts_str).strip()
+    try:
+        parts = ts_str.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600000 + int(m) * 60000 + int(float(s) * 1000)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60000 + int(float(s) * 1000)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _parse_ass_file_manually(ass_path):
+    """
+    Fallback ASS parser for when pysubs2 fails (e.g., malformed drawing commands,
+    corrupted timestamps from color normalization, etc.).
+    Returns a list of pysubs2.SSAEvent-like dicts with start, end, text fields.
+    """
+    entries = []
+    try:
+        with open(ass_path, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                line = line.strip()
+                if not line.lower().startswith('dialogue:'):
+                    continue
+                # Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+                # Remove the "Dialogue:" prefix and split
+                rest = line[len('dialogue:'):].lstrip()
+                # Split on commas, but preserve the text field (which may contain commas)
+                fields = rest.split(',', 9)
+                if len(fields) < 10:
+                    continue
+                start_ms = _parse_ass_timestamp(fields[1])
+                end_ms = _parse_ass_timestamp(fields[2])
+                if start_ms is None or end_ms is None:
+                    continue
+                text = fields[9]
+                # Skip drawing commands
+                if r'\p1' in text or r'\p2' in text or r'\p3' in text or r'\p4' in text:
+                    continue
+                entries.append({
+                    'start': start_ms,
+                    'end': end_ms,
+                    'text': text,
+                })
+    except Exception as e:
+        logging.warning(f"Manual ASS fallback parser also failed for {ass_path}: {e}")
+    return entries
+
+
 def load_reference_subtitle_entries(subtitle_path, strip_sdh=False):
     """Load simplified dialogue entries from a secondary subtitle file."""
     if not subtitle_path:
         return []
 
     normalize_ass_colors(subtitle_path)
-    subs = pysubs2.load(str(subtitle_path))
 
     ass_header_keywords = [
         "[Script Info]",
@@ -2243,37 +2626,72 @@ def load_reference_subtitle_entries(subtitle_path, strip_sdh=False):
     ]
 
     entries = []
-    for event in subs:
-        if not hasattr(event, "type") or event.type != "Dialogue":
-            continue
+    try:
+        subs = pysubs2.load(str(subtitle_path))
 
-        if (
-            r"\p1" in event.text
-            or r"\p2" in event.text
-            or r"\p3" in event.text
-            or r"\p4" in event.text
-        ):
-            continue
-
-        if any(keyword in event.text for keyword in ass_header_keywords):
-            continue
-
-        plain_text = remove_formatting(event.text)
-        if not plain_text:
-            continue
-
-        if strip_sdh:
-            plain_text = strip_sdh_elements(plain_text)
-            if not plain_text or is_sdh_only_line(plain_text):
+        for event in subs:
+            if not hasattr(event, "type") or event.type != "Dialogue":
                 continue
 
-        entries.append(
-            {
-                "start": event.start,
-                "end": event.end,
-                "content": plain_text.strip(),
-            }
+            if (
+                r"\p1" in event.text
+                or r"\p2" in event.text
+                or r"\p3" in event.text
+                or r"\p4" in event.text
+            ):
+                continue
+
+            if any(keyword in event.text for keyword in ass_header_keywords):
+                continue
+
+            plain_text = remove_formatting(event.text)
+            if not plain_text:
+                continue
+
+            if strip_sdh:
+                plain_text = strip_sdh_elements(plain_text)
+                if not plain_text or is_sdh_only_line(plain_text):
+                    continue
+
+            entries.append(
+                {
+                    "start": event.start,
+                    "end": event.end,
+                    "content": plain_text.strip(),
+                }
+            )
+    except Exception as e:
+        logging.warning(
+            f"pysubs2 failed to parse {subtitle_path.name}: {e}. Trying manual fallback parser."
         )
+        # Fallback: parse ASS manually to extract what we can
+        fallback_entries = _parse_ass_file_manually(subtitle_path)
+        for entry in fallback_entries:
+            text = entry['text']
+            if any(keyword in text for keyword in ass_header_keywords):
+                continue
+            plain_text = remove_formatting(text)
+            if not plain_text:
+                continue
+            if strip_sdh:
+                plain_text = strip_sdh_elements(plain_text)
+                if not plain_text or is_sdh_only_line(plain_text):
+                    continue
+            entries.append(
+                {
+                    "start": entry['start'],
+                    "end": entry['end'],
+                    "content": plain_text.strip(),
+                }
+            )
+        if fallback_entries and not entries:
+            logging.warning(
+                f"Manual fallback parser found {len(fallback_entries)} lines but none passed filters"
+            )
+        elif entries:
+            logging.info(
+                f"Manual fallback parser recovered {len(entries)} dialogue entries from {subtitle_path.name}"
+            )
 
     return entries
 
@@ -3477,6 +3895,8 @@ def translate_ass_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=None,
+    review_batch_size=150,
 ):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
@@ -4280,6 +4700,38 @@ def translate_ass_file(
             # Then restore ASS formatting tags
             event.text = restore_formatting(original_texts[i], restored_directives)
 
+        # --- Review pass: check for gender, consistency, and quality issues ---
+        # review: True=always, False=never, None=ask interactively
+        should_review = review
+        if should_review is None:
+            clear_progress()
+            should_review = prompt_yes_no(
+                "Translation complete. Run AI review pass to check for gender agreement, "
+                "consistency, and other issues?",
+                default=False,
+            )
+        if should_review:
+            try:
+                review_corrections = review_translation(
+                    dialogue_events=dialogue_events,
+                    original_texts=original_texts,
+                    translated_subtitle=translated_subtitle,
+                    source_lang=lang_code,
+                    target_lang="Latin American Spanish",
+                    api_manager=api_manager,
+                    model_name=model_name,
+                    thinking=thinking,
+                    thinking_budget=thinking_budget,
+                    extra_context_text=extra_context_text,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    review_batch_size=review_batch_size,
+                )
+                logger.info(f"Review applied {review_corrections} correction(s)")
+            except Exception as e:
+                logger.warning(f"Review pass failed (translation is still saved): {e}")
+
         # Remove SDH-only events from the subtitle file before saving
         if strip_sdh and sdh_events_to_remove:
             for event in sdh_events_to_remove:
@@ -4892,6 +5344,8 @@ def process_mkv_ocr_file(
     top_k=None,
     strip_sdh=False,
     skip_ocr_review=False,
+    review=None,
+    review_batch_size=150,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
     print(f"\n{'=' * 60}")
@@ -5254,6 +5708,8 @@ def process_mkv_ocr_file(
             top_p,
             top_k,
             strip_sdh,
+            review,
+            review_batch_size,
         )
 
         if translated_subtitle_path:
@@ -5283,6 +5739,8 @@ def process_raw_subtitle_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=None,
+    review_batch_size=150,
 ):
     """Translate a standalone text subtitle file directly."""
     source_lang = normalize_track_language(source_lang)
@@ -5328,6 +5786,8 @@ def process_raw_subtitle_file(
         top_p,
         top_k,
         strip_sdh,
+        review,
+        review_batch_size,
     )
 
     if translated_subtitle_path:
@@ -5355,6 +5815,8 @@ def process_mkv_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=None,
+    review_batch_size=150,
 ):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
@@ -5450,6 +5912,8 @@ def process_mkv_file(
             top_p,
             top_k,
             strip_sdh,
+            review,
+            review_batch_size,
         )
 
         # 5. Merge the translated subtitle back into a new MKV
@@ -5611,6 +6075,24 @@ def main():
         help="Remove SDH (Subtitles for Deaf/Hard of Hearing) elements like [sound effects], speaker names, and music symbols.",
     )
     parser.add_argument(
+        "--review",
+        action="store_true",
+        default=False,
+        help="After translation, always run the review pass (skip the prompt). "
+        "If neither --review nor --no-review is given, you will be asked interactively.",
+    )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Skip the translation review pass entirely (never review).",
+    )
+    parser.add_argument(
+        "--review-batch-size",
+        type=int,
+        default=150,
+        help="Number of lines per review batch (default: 150). Only used when review is enabled.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=None,
@@ -5712,6 +6194,17 @@ def main():
     # Handle thinking mode flags
     if args.no_thinking:
         args.thinking = False
+
+    # Handle review flags: --review=True, --no-review=False, neither=None (ask)
+    if args.review and args.no_review:
+        logger.error("--review and --no-review are mutually exclusive.")
+        sys.exit(1)
+    if args.review:
+        args.review = True
+    elif args.no_review:
+        args.review = False
+    else:
+        args.review = None  # ask interactively
 
     if is_ollama_provider(args.provider):
         if (args.audio_file or args.extract_audio) and not args.ocr:
@@ -5903,6 +6396,8 @@ def main():
                     top_k=args.top_k,
                     strip_sdh=args.strip_sdh,
                     skip_ocr_review=args.skip_ocr_review,
+                    review=args.review,
+                    review_batch_size=args.review_batch_size,
                 )
             else:
                 chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
@@ -5924,6 +6419,8 @@ def main():
                     args.top_p,
                     args.top_k,
                     args.strip_sdh,
+                    args.review,
+                    args.review_batch_size,
                 )
                 # Remember language selection for subsequent files
                 if chosen_lang:
@@ -5954,6 +6451,8 @@ def main():
                 top_p=args.top_p,
                 top_k=args.top_k,
                 strip_sdh=args.strip_sdh,
+                review=args.review,
+                review_batch_size=args.review_batch_size,
             )
         # Remember batch size adjustment for subsequent files
         if final_batch_size and final_batch_size != remembered_batch_size:
